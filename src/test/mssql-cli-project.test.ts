@@ -19,7 +19,8 @@ const exec: MssqlRowExecutor = async (sql, params) => {
   }
   if (sql.includes('INFORMATION_SCHEMA.KEY_COLUMN_USAGE'))
     return [{ TABLE_NAME: 'users', COLUMN_NAME: 'id', ORDINAL_POSITION: 1 }];
-  if (sql.includes('sys.foreign_keys') || sql.includes('sys.indexes')) return [];
+  if (sql.includes('sys.foreign_keys') || sql.includes('sys.indexes') || sql.includes('sys.check_constraints'))
+    return [];
   throw new Error(`Unexpected catalog query: ${sql}`);
 };
 

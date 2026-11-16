@@ -49,7 +49,7 @@ function catalog(columnType: unknown, dataType = 'enum', charset?: string) {
         },
       ];
     }
-    assert.match(sql, /information_schema\.(KEY_COLUMN_USAGE|STATISTICS)/);
+    assert.match(sql, /information_schema\.(KEY_COLUMN_USAGE|STATISTICS|TABLE_CONSTRAINTS)/);
     return [];
   };
   return { exec, calls };
@@ -65,7 +65,7 @@ describe('MySQL inline ENUM catalog decoding', () => {
     assert.deepEqual(Object.keys(metadata.enums), ['labels.value', 'other.value']);
     assert.deepEqual(metadata.enums['labels.value'], fixture.labels);
     assert.deepEqual(metadata.enums['other.value'], ['simple', '']);
-    assert.equal(calls.length, 5);
+    assert.equal(calls.length, 6);
     assert(calls.every((sql) => /^SELECT\b/.test(sql)));
     for (let code = 0; code < 32; code++) assert(fixture.labels.includes(`ascii${String.fromCharCode(code)}mid`));
     assert(fixture.labels.includes(`del${String.fromCharCode(127)}mid`));
@@ -92,7 +92,7 @@ describe('MySQL inline ENUM catalog decoding', () => {
       assert.equal(metadata.tables.other!.columns[0]!.enumLabelsUnrecoverable, undefined);
       assert.equal(warnings.length, 1);
       assert.match(warnings[0]!, /"labels\.value"/);
-      assert.equal(calls.length, 5);
+      assert.equal(calls.length, 6);
       assert(calls.every((sql) => /^SELECT\b/.test(sql)));
     }
   });

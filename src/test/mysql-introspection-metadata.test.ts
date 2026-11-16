@@ -65,6 +65,7 @@ function catalog(
         },
       ];
     }
+    if (sql.includes('information_schema.TABLE_CONSTRAINTS')) return [];
     assert.match(sql, /information_schema.STATISTICS/);
     assert.match(sql, /SUB_PART, EXPRESSION, COLLATION, INDEX_TYPE, IS_VISIBLE, INDEX_COMMENT/);
     return [

@@ -748,6 +748,40 @@ export function addAutoManyToManyRelations(
   }
 }
 
+/** PostgreSQL's identifier limit, NAMEDATALEN - 1 bytes. */
+const PG_NAME_BYTES = 63;
+
+const utf8Bytes = (s: string): number => {
+  let n = 0;
+  for (const ch of s) {
+    const code = ch.codePointAt(0)!;
+    n += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+  }
+  return n;
+};
+
+/** The longest prefix of `s` that fits in `bytes` bytes of UTF-8, never ending inside a character. */
+const clipUtf8 = (s: string, bytes: number): string => {
+  let out = '';
+  let used = 0;
+  for (const ch of s) {
+    used += utf8Bytes(ch);
+    if (used > bytes) break;
+    out += ch;
+  }
+  return out;
+};
+
+/**
+ * An identifier as PostgreSQL stores it: cut to 63 bytes of UTF-8, never
+ * inside a character (`truncate_identifier`). Other engines keep longer names
+ * (MySQL 64 characters, SQL Server 128), so a name read from their catalogs or
+ * DDL is cut the same way before a relation is named from it.
+ */
+export function postgresIdentifier(name: string): string {
+  return clipUtf8(name, PG_NAME_BYTES);
+}
+
 /**
  * The constraint name PostgreSQL gives a foreign key nobody named:
  * `<table>_<column>[_<column>...]_fkey`, truncated the way PostgreSQL truncates
@@ -763,42 +797,25 @@ export function addAutoManyToManyRelations(
  * that shape derives the same relation names as on PostgreSQL.
  */
 export function defaultForeignKeyConstraintName(table: string, columns: string[], taken?: Set<string>): string {
-  const PG_NAME_BYTES = 63;
-  const bytesOf = (s: string): number => {
-    let n = 0;
-    for (const ch of s) {
-      const code = ch.codePointAt(0)!;
-      n += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
-    }
-    return n;
-  };
-  const clip = (s: string, bytes: number): string => {
-    let out = '';
-    for (const ch of s) {
-      if (bytesOf(out + ch) > bytes) break;
-      out += ch;
-    }
-    return out;
-  };
   // ChooseForeignKeyConstraintNameAddition: columns joined by `_`, stopping
   // once the addition reaches NAMEDATALEN.
   let addition = '';
   for (const column of columns) {
     if (addition.length > 0) addition += '_';
     addition += column;
-    if (bytesOf(addition) >= PG_NAME_BYTES + 1) break;
+    if (utf8Bytes(addition) >= PG_NAME_BYTES + 1) break;
   }
   // makeObjectName + ChooseConstraintName.
   for (let pass = 0; ; pass++) {
     const label = pass === 0 ? 'fkey' : `fkey${pass}`;
-    let tableBytes = bytesOf(table);
-    let additionBytes = bytesOf(addition);
+    let tableBytes = utf8Bytes(table);
+    let additionBytes = utf8Bytes(addition);
     const available = PG_NAME_BYTES - (label.length + 2);
     while (tableBytes + additionBytes > available) {
       if (tableBytes > additionBytes) tableBytes--;
       else additionBytes--;
     }
-    const name = `${clip(table, tableBytes)}_${clip(addition, additionBytes)}_${label}`;
+    const name = `${clipUtf8(table, tableBytes)}_${clipUtf8(addition, additionBytes)}_${label}`;
     if (!taken?.has(name)) {
       taken?.add(name);
       return name;
@@ -808,15 +825,22 @@ export function defaultForeignKeyConstraintName(table: string, columns: string[]
 
 /**
  * One table's foreign-key constraint names, as PostgreSQL names the same
- * declarations: an explicit name is the key's own, and each unnamed key, in
- * declaration order, takes {@link defaultForeignKeyConstraintName}, counting up
- * while the name is taken. On PostgreSQL these are catalog facts, so declaring
- * the same two unnamed keys the other way round gives the `1` suffix to the
- * other one; every engine follows the same rule.
+ * declarations: an explicit name is the key's own (cut to 63 bytes, see
+ * {@link postgresIdentifier}), and each unnamed key, in declaration order, takes
+ * {@link defaultForeignKeyConstraintName}, counting up while the name is taken.
+ * On PostgreSQL these are catalog facts, so declaring the same two unnamed keys
+ * the other way round gives the `1` suffix to the other one; every engine
+ * follows the same rule.
  *
- * Every explicit name is reserved before any default is chosen. PostgreSQL
- * names keys one at a time, but refuses an explicit name that an earlier
- * default already took, so for every statement it accepts the two agree.
+ * What a default must avoid: every other constraint the table carries
+ * (`reserved`: PRIMARY KEY, UNIQUE, CHECK and NOT NULL, which PostgreSQL creates
+ * before any foreign key, but not a plain index, which it does not consult), and
+ * every explicit foreign-key name. All of them are reserved before any default
+ * is chosen. PostgreSQL itself names foreign keys one at a time and refuses a
+ * statement whose explicit name an earlier unnamed key already took, so for
+ * every statement PostgreSQL accepts, reserving first gives its answer; for one
+ * it refuses, the explicit key still keeps its name.
+ *
  * `taken` is one set for the whole schema, because PostgreSQL checks a default
  * against every constraint name in it. Where two tables' defaults coincide it
  * gives the counter to the table created second; the catalog readers name
@@ -824,14 +848,18 @@ export function defaultForeignKeyConstraintName(table: string, columns: string[]
  *
  * @param keys the table's foreign keys in declaration order, `name` undefined
  *   for an unnamed one
+ * @param reserved the table's other constraint names
  */
 export function foreignKeyConstraintNames(
   table: string,
   keys: readonly { columns: string[]; name: string | undefined }[],
   taken: Set<string>,
+  reserved: Iterable<string> = [],
 ): string[] {
-  for (const key of keys) if (key.name !== undefined) taken.add(key.name);
-  return keys.map((key) => key.name ?? defaultForeignKeyConstraintName(table, key.columns, taken));
+  const names = keys.map((key) => (key.name === undefined ? undefined : postgresIdentifier(key.name)));
+  for (const name of reserved) taken.add(postgresIdentifier(name));
+  for (const name of names) if (name !== undefined) taken.add(name);
+  return keys.map((key, i) => names[i] ?? defaultForeignKeyConstraintName(table, key.columns, taken));
 }
 
 /**

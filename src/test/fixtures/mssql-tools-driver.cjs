@@ -115,6 +115,7 @@ class ConnectionPool {
               { TABLE_NAME: 'posts', COLUMN_NAME: 'id', ORDINAL_POSITION: 1 },
             ],
           };
+        if (sql.includes('sys.check_constraints')) return { recordset: [] };
         if (sql.includes('sys.foreign_keys'))
           return {
             recordset: [

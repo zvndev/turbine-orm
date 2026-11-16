@@ -2023,7 +2023,23 @@ export async function introspectMssqlWith(
   // name PostgreSQL would have given it, so that relation is named the same on
   // every database and on every engine; an explicit name is reserved first.
   // SQL Server records no declaration order, so system-named keys are named in
-  // the order of their columns and what they reference, never of the suffix.
+  // the order of their columns and what they reference, never of the suffix. A
+  // default also avoids the table's explicit CHECK, PRIMARY KEY and UNIQUE
+  // constraint names, which PostgreSQL creates first.
+  const reserved = new Map<string, string[]>();
+  for (const r of await exec(
+    `SELECT OBJECT_NAME(k.parent_object_id) AS TABLE_NAME, k.name AS CONSTRAINT_NAME
+     FROM sys.key_constraints k JOIN sys.schemas s ON s.schema_id = k.schema_id
+     WHERE s.name = @p1 AND k.is_system_named = 0
+     UNION ALL
+     SELECT OBJECT_NAME(c.parent_object_id), c.name
+     FROM sys.check_constraints c JOIN sys.schemas s ON s.schema_id = c.schema_id
+     WHERE s.name = @p1 AND c.is_system_named = 0`,
+    [schema],
+  )) {
+    const table = String(r.TABLE_NAME);
+    reserved.set(table, [...(reserved.get(table) ?? []), String(r.CONSTRAINT_NAME)]);
+  }
   const constraintNames = new Set<string>();
   const foreignKeys: ForeignKeyEntry[] = [];
   const identity = ({ fk }: { fk: ForeignKeyEntry }) =>
@@ -2039,6 +2055,7 @@ export async function introspectMssqlWith(
         name: systemNamed ? undefined : fk.constraintName,
       })),
       constraintNames,
+      reserved.get(table),
     );
     keys.forEach(({ fk }, i) => {
       fk.constraintName = names[i]!;

@@ -108,12 +108,27 @@ function identifierList(def: Token[], at: number): [string[], number] | undefine
 }
 
 const TABLE_CONSTRAINTS = new Set(['CONSTRAINT', 'PRIMARY', 'UNIQUE', 'CHECK', 'FOREIGN']);
+/**
+ * The column constraints a `CONSTRAINT <name>` names in PostgreSQL's catalog.
+ * A name on DEFAULT, COLLATE or GENERATED creates no constraint there.
+ */
+const NAMED_COLUMN_CONSTRAINTS = new Set(['PRIMARY', 'UNIQUE', 'CHECK', 'REFERENCES', 'NOT']);
 
 /** Every foreign key a `CREATE TABLE` statement declares, in statement order. */
 export function declaredForeignKeys(createTable: string): DeclaredForeignKey[] {
+  return readCreateTable(createTable).foreignKeys;
+}
+
+/**
+ * The statement's foreign keys, and the names of every constraint it names
+ * (PRIMARY KEY, UNIQUE, CHECK, NOT NULL and foreign keys, table- or
+ * column-level): PostgreSQL creates all of them before it names an unnamed
+ * foreign key, so a default must avoid them.
+ */
+function readCreateTable(createTable: string): { foreignKeys: DeclaredForeignKey[]; constraintNames: string[] } {
   const tokens = tokenize(createTable);
   const open = tokens.findIndex((t) => punct(t, '('));
-  if (open === -1) return [];
+  if (open === -1) return { foreignKeys: [], constraintNames: [] };
 
   // Split the body into its comma-separated definitions, marking the tokens
   // inside a definition's own parentheses (a type's, a CHECK's, a column list).
@@ -138,6 +153,7 @@ export function declaredForeignKeys(createTable: string): DeclaredForeignKey[] {
   }
 
   const found: DeclaredForeignKey[] = [];
+  const constraintNames: string[] = [];
   // REFERENCES <table> [(<columns>)] at `def[at]`.
   const reference = (def: Token[], at: number, columns: string[], name: string | undefined) => {
     const table = keyword(def[at]) === 'REFERENCES' ? identifier(def[at + 1]) : undefined;
@@ -148,6 +164,8 @@ export function declaredForeignKeys(createTable: string): DeclaredForeignKey[] {
   for (const def of definitions) {
     const first = keyword(def[0]);
     if (first !== undefined && TABLE_CONSTRAINTS.has(first)) {
+      const name = first === 'CONSTRAINT' ? identifier(def[1]) : undefined;
+      if (name !== undefined && TABLE_CONSTRAINTS.has(keyword(def[2]) ?? '')) constraintNames.push(name);
       // [CONSTRAINT <name>] FOREIGN KEY (<columns>) REFERENCES <table> [(<columns>)]
       const at = first === 'CONSTRAINT' ? 2 : 0;
       if (keyword(def[at]) !== 'FOREIGN' || keyword(def[at + 1]) !== 'KEY') continue;
@@ -160,19 +178,26 @@ export function declaredForeignKeys(createTable: string): DeclaredForeignKey[] {
     if (column === undefined) continue;
     const top = def.flatMap((t, k) => (t.nested ? [] : [k]));
     for (let k = 1; k < top.length; k++) {
+      // CONSTRAINT <name> NOT NULL / UNIQUE / CHECK / PRIMARY KEY / REFERENCES
+      if (keyword(def[top[k]!]) === 'CONSTRAINT') {
+        const name = identifier(def[top[k + 1]!]);
+        if (name !== undefined && NAMED_COLUMN_CONSTRAINTS.has(keyword(def[top[k + 2]!]) ?? ''))
+          constraintNames.push(name);
+      }
       if (keyword(def[top[k]!]) !== 'REFERENCES') continue;
       const named = k >= 3 && keyword(def[top[k - 2]!]) === 'CONSTRAINT';
       reference(def, top[k]!, [column], named ? identifier(def[top[k - 1]!]) : undefined);
     }
   }
-  return found;
+  return { foreignKeys: found, constraintNames };
 }
 
 /**
  * Names every foreign key of one SQLite table as PostgreSQL names the same
  * declarations, setting each key's `constraintName`: its declared `CONSTRAINT`
  * name, else (see {@link foreignKeyConstraintNames}) PostgreSQL's default in
- * declaration order, with every declared name reserved first.
+ * declaration order, with every constraint name the statement declares
+ * reserved first.
  *
  * A key is matched to its declaration by its whole identity, child columns,
  * target table and referenced columns, compared as SQLite compares
@@ -196,8 +221,8 @@ export function nameSqliteForeignKeys(
   const identity = (columns: string[], target: string, references: string[]) =>
     fold(JSON.stringify([columns, target, references]));
   const declared = new Map<string, (string | undefined)[]>();
-  for (const d of declaredForeignKeys(createTable)) {
-    if (d.name !== undefined) taken.add(d.name);
+  const statement = readCreateTable(createTable);
+  for (const d of statement.foreignKeys) {
     const id = identity(d.columns, d.table, d.references);
     declared.set(id, [...(declared.get(id) ?? []), d.name]);
   }
@@ -216,6 +241,7 @@ export function nameSqliteForeignKeys(
       return { columns: k.sourceColumns, name: matched ? names![rank] : undefined };
     }),
     taken,
+    statement.constraintNames,
   );
   ordered.forEach((k, i) => {
     k.constraintName = names[i]!;

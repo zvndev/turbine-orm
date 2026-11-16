@@ -2006,6 +2006,18 @@ export async function introspectMysqlWith(
   // catalog lists `_ibfk_10` before `_ibfk_2`), and each takes PostgreSQL's
   // default in that order. The catalog cannot tell an explicit name in that
   // form from a generated one, so it reads as generated.
+  //
+  // A default also avoids the table's other constraint names. MySQL lists a
+  // UNIQUE index here exactly as a UNIQUE constraint, so both are reserved
+  // (PostgreSQL would not consult an index); a primary key is always `PRIMARY`.
+  const reserved = new Map<string, string[]>();
+  for (const r of (await exec(
+    `SELECT TABLE_NAME, CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS
+     WHERE TABLE_SCHEMA = :p1 AND CONSTRAINT_TYPE IN ('UNIQUE', 'CHECK')`,
+    [schema],
+  )) as unknown as { TABLE_NAME: string; CONSTRAINT_NAME: string }[]) {
+    reserved.set(r.TABLE_NAME, [...(reserved.get(r.TABLE_NAME) ?? []), r.CONSTRAINT_NAME]);
+  }
   const constraintNames = new Set<string>();
   const foreignKeys: ForeignKeyEntry[] = [];
   for (const [table, entries] of [...fkByTable].sort(([a], [b]) => compareCatalogNames(a, b))) {
@@ -2018,6 +2030,7 @@ export async function introspectMysqlWith(
       table,
       keys.map(({ fk, n }) => ({ columns: fk.sourceColumns, name: n < 0 ? fk.constraintName : undefined })),
       constraintNames,
+      reserved.get(table),
     );
     keys.forEach(({ fk }, i) => {
       fk.constraintName = names[i]!;

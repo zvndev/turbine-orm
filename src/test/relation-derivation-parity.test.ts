@@ -31,7 +31,7 @@ import { createRequire } from 'node:module';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import { after, before, describe, it } from 'node:test';
 import type { BetterSqlite3Database } from '../better-sqlite3.js';
-import { defaultForeignKeyConstraintName, foreignKeyConstraintNames } from '../catalog-metadata.js';
+import { defaultForeignKeyConstraintName, foreignKeyConstraintNames, postgresIdentifier } from '../catalog-metadata.js';
 import { type RelationDef, type SchemaMetadata, snakeToCamel } from '../schema.js';
 import { defineSchema } from '../schema-builder.js';
 import { schemaDefToMetadata } from '../schema-metadata.js';
@@ -68,6 +68,8 @@ interface TableSpec {
   unique?: string[][];
   /** Plain UNIQUE indexes (not constraints). */
   uniqueIndexes?: string[][];
+  /** Named CHECK and UNIQUE constraints. */
+  constraints?: ({ name: string; check: string } | { name: string; unique: string[] })[];
   foreignKeys?: FkSpec[];
 }
 
@@ -92,6 +94,12 @@ interface Case {
   expected: Relations;
   /** One engine that derives something else, for a reason docs/relation-names.md states, and what it derives. */
   differsOn?: { engine: string; expected: Relations };
+  /**
+   * Rows to insert (portable INSERT statements) and a read to run through each
+   * engine's client: a relation name has to select the same rows everywhere,
+   * not only exist.
+   */
+  query?: { insert: string[]; table: string; args: Record<string, unknown>; rows: unknown[] };
 }
 
 const upperFirst = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
@@ -146,6 +154,9 @@ const LONG_B = `${'shipment_reference_'.repeat(3)}two`;
 const LONG_BASE = 'linksXShipmentReferenceShipmentReferenceShipmentRef';
 const TAG_COLUMNS = [...'abcdefghi'].map((c) => `tag_${c}_id`);
 const cascade = (relation: NormRelation): NormRelation => ({ ...relation, onDelete: 'cascade' });
+/** 64 bytes, and 65 bytes of two-byte characters: PostgreSQL keeps 63 bytes, never part of a character. */
+const LONG_ASCII_NAME = `fk_${'a'.repeat(61)}`;
+const LONG_UTF8_NAME = `fk_${'é'.repeat(31)}`;
 
 const CASES: Case[] = [
   {
@@ -583,6 +594,73 @@ const CASES: Case[] = [
     },
   },
   {
+    // PostgreSQL creates a table's CHECK, UNIQUE and PRIMARY KEY constraints
+    // before naming any foreign key, so a CHECK named like the first default
+    // pushes both keys up the counter. The read shows the name selects the same
+    // parent on every engine.
+    name: "a CHECK constraint named like a foreign key's default name",
+    tables: [
+      PARENTS_AB_CD,
+      t('links', [int('x'), int('y')], {
+        primaryKey: [],
+        constraints: [{ name: 'links_x_y_fkey', check: 'x > 0' }],
+        foreignKeys: [fk(XY, 'parents', AB), fk(XY, 'parents', CD)],
+      }),
+    ],
+    noCodeFirst: 'defineSchema `references` is single-column',
+    expected: {
+      links: { linksXYFkey1: belongsTo('parents', XY, AB), linksXYFkey2: belongsTo('parents', XY, CD) },
+      parents: { linksByLinksXYFkey1: hasMany('links', XY, AB), linksByLinksXYFkey2: hasMany('links', XY, CD) },
+    },
+    query: {
+      insert: ['INSERT INTO parents VALUES (1, 2, 3, 4), (5, 6, 1, 2)', 'INSERT INTO links VALUES (1, 2)'],
+      table: 'links',
+      args: { with: { linksXYFkey1: true } },
+      rows: [{ x: 1, y: 2, linksXYFkey1: { a: 1, b: 2, c: 3, d: 4 } }],
+    },
+  },
+  {
+    name: "a UNIQUE constraint named like a foreign key's default name",
+    tables: [
+      PARENTS_AB_CD,
+      t('links', [int('x'), int('y'), int('w')], {
+        primaryKey: [],
+        constraints: [{ name: 'links_x_y_fkey', unique: ['w'] }],
+        foreignKeys: [fk(XY, 'parents', CD), fk(XY, 'parents', AB)],
+      }),
+    ],
+    noCodeFirst: 'defineSchema `references` is single-column',
+    expected: {
+      links: { linksXYFkey1: belongsTo('parents', XY, CD), linksXYFkey2: belongsTo('parents', XY, AB) },
+      parents: { linksByLinksXYFkey1: hasMany('links', XY, CD), linksByLinksXYFkey2: hasMany('links', XY, AB) },
+    },
+  },
+  {
+    name: 'explicit constraint names longer than 63 bytes',
+    tables: [
+      PARENTS_AB_CD,
+      t('links', [int('x'), int('y'), int('z')], {
+        primaryKey: [],
+        foreignKeys: [
+          fk(XY, 'parents', AB, { name: LONG_ASCII_NAME }),
+          fk(['x', 'z'], 'parents', AB, { name: LONG_UTF8_NAME }),
+        ],
+      }),
+    ],
+    noCodeFirst: 'defineSchema `references` is single-column',
+    expected: {
+      links: {
+        ['a'.repeat(60)]: belongsTo('parents', XY, AB),
+        ['é'.repeat(30)]: belongsTo('parents', ['x', 'z'], AB),
+      },
+      parents: {
+        [`linksByA${'a'.repeat(59)}`]: hasMany('links', XY, AB),
+        // `snakeToCamel` capitalizes only an ASCII letter after `_`.
+        [`linksBy_${'é'.repeat(30)}`]: hasMany('links', ['x', 'z'], AB),
+      },
+    },
+  },
+  {
     name: 'junction table, pure',
     tables: [
       t('posts', [id(), text('title')]),
@@ -813,6 +891,9 @@ function renderDdl(tables: TableSpec[], engine: Engine): string[] {
     );
     if (table.primaryKey?.length) parts.push(`PRIMARY KEY (${list(table.primaryKey)})`);
     for (const u of table.unique ?? []) parts.push(`UNIQUE (${list(u)})`);
+    for (const k of table.constraints ?? []) {
+      parts.push(`CONSTRAINT ${q(k.name)} ${'check' in k ? `CHECK (${k.check})` : `UNIQUE (${list(k.unique)})`}`);
+    }
     for (const f of table.foreignKeys ?? []) {
       parts.push(
         `${f.name ? `CONSTRAINT ${q(f.name)} ` : ''}FOREIGN KEY (${list(f.columns)}) REFERENCES ${q(f.table)} (${list(f.references)})${f.onDelete ? ' ON DELETE CASCADE' : ''}`,
@@ -889,9 +970,13 @@ interface Harness {
   runners: GatedRunners;
   setup?(): Promise<void>;
   teardown?(): Promise<void>;
-  /** Create the case's tables in a fresh namespace and introspect it. */
-  introspect(c: Case, index: number): Promise<SchemaMetadata>;
+  /** Create the case's tables (and its query's rows) in a fresh namespace, introspect it, and run its query. */
+  introspect(c: Case, index: number): Promise<{ schema: SchemaMetadata; rows?: unknown }>;
 }
+
+// biome-ignore lint/suspicious/noExplicitAny: each engine's client, typed by the metadata only at runtime.
+const runQuery = (client: { table(name: string): any }, q: NonNullable<Case['query']>) =>
+  client.table(q.table).findMany(q.args);
 
 const silent = { logger: {} };
 
@@ -924,18 +1009,25 @@ const HARNESSES: Harness[] = [
     name: 'code-first',
     runners: { it, before, after },
     async introspect(c) {
-      return codeFirstMetadata(c.tables);
+      return { schema: codeFirstMetadata(c.tables) };
     },
   },
   {
     name: 'node:sqlite',
     runners: skipGate(!DatabaseSync, 'turbine-orm/sqlite requires node:sqlite (Node >= 22.5)'),
     async introspect(c) {
-      const { introspectSqliteDatabase } = await import('../sqlite.js');
+      const { introspectSqliteDatabase, turbineSqlite } = await import('../sqlite.js');
       const db = new DatabaseSync!(':memory:');
       try {
-        for (const stmt of renderDdl(c.tables, 'sqlite')) db.exec(stmt);
-        return introspectSqliteDatabase(db, silent);
+        for (const stmt of [...renderDdl(c.tables, 'sqlite'), ...(c.query?.insert ?? [])]) db.exec(stmt);
+        const schema = introspectSqliteDatabase(db, silent);
+        if (!c.query) return { schema };
+        const client = turbineSqlite(db, schema, silent);
+        try {
+          return { schema, rows: await runQuery(client, c.query) };
+        } finally {
+          await client.disconnect();
+        }
       } finally {
         db.close();
       }
@@ -945,11 +1037,18 @@ const HARNESSES: Harness[] = [
     name: 'better-sqlite3',
     runners: skipGate(!BetterSqlite3, 'requires the optional better-sqlite3 peer (set TURBINE_SQLITE_BINDING_PEER)'),
     async introspect(c) {
-      const { introspectBetterSqlite3Database } = await import('../better-sqlite3.js');
+      const { introspectBetterSqlite3Database, turbineBetterSqlite3 } = await import('../better-sqlite3.js');
       const db = new BetterSqlite3!(':memory:');
       try {
-        for (const stmt of renderDdl(c.tables, 'sqlite')) db.exec(stmt);
-        return introspectBetterSqlite3Database(db, silent);
+        for (const stmt of [...renderDdl(c.tables, 'sqlite'), ...(c.query?.insert ?? [])]) db.exec(stmt);
+        const schema = introspectBetterSqlite3Database(db, silent);
+        if (!c.query) return { schema };
+        const client = await turbineBetterSqlite3(db, schema, silent);
+        try {
+          return { schema, rows: await runQuery(client, c.query) };
+        } finally {
+          await client.disconnect();
+        }
       } finally {
         db.close();
       }
@@ -990,7 +1089,7 @@ const HARNESSES: Harness[] = [
           // Transaction-scoped search_path, so no session state outlives the case.
           await client.query('BEGIN');
           await client.query(`SELECT set_config('search_path', $1, true)`, [schema]);
-          for (const stmt of renderDdl(c.tables, 'postgres')) await client.query(stmt);
+          for (const stmt of [...renderDdl(c.tables, 'postgres'), ...(c.query?.insert ?? [])]) await client.query(stmt);
           await client.query('COMMIT');
         } catch (error) {
           await client.query('ROLLBACK');
@@ -999,7 +1098,21 @@ const HARNESSES: Harness[] = [
           client.release();
         }
         try {
-          return await introspect({ connectionString: url, schema, ...silent });
+          const metadata = await introspect({ connectionString: url, schema, ...silent });
+          if (!c.query) return { schema: metadata };
+          const { default: pg } = await import('pg');
+          const { TurbineClient } = await import('../client.js');
+          // The case's schema as a connection parameter of a pool of its own,
+          // never a session SET.
+          const casePool = new pg.Pool({ connectionString: url, max: 1, options: `-c search_path=${schema}` });
+          try {
+            return {
+              schema: metadata,
+              rows: await runQuery(new TurbineClient({ pool: casePool, ...silent }, metadata), c.query),
+            };
+          } finally {
+            await casePool.end();
+          }
         } finally {
           await pool.query(`DROP SCHEMA ${schema} CASCADE`);
         }
@@ -1024,7 +1137,7 @@ const HARNESSES: Harness[] = [
         };
       },
       async introspect(c, index) {
-        const { MysqlPool, introspectMysqlWith } = await import('../mysql.js');
+        const { MysqlPool, introspectMysqlWith, mysqlDialect } = await import('../mysql.js');
         // One database per case: MySQL's database is the namespace introspection reads.
         const database = `${DB_NAME}_${index}`;
         const admin = await mysql.createConnection(base);
@@ -1036,13 +1149,20 @@ const HARNESSES: Harness[] = [
         }
         const raw = mysql.createPool({ ...base, database, namedPlaceholders: true, connectionLimit: 1 });
         try {
-          for (const stmt of renderDdl(c.tables, 'mysql')) await raw.query(stmt);
+          for (const stmt of [...renderDdl(c.tables, 'mysql'), ...(c.query?.insert ?? [])]) await raw.query(stmt);
           const pool = new MysqlPool(raw);
-          return await introspectMysqlWith(
+          const schema = await introspectMysqlWith(
             async (sql, params) => (await pool.query(sql, params)).rows,
             database,
             silent,
           );
+          if (!c.query) return { schema };
+          const { TurbineClient } = await import('../client.js');
+          const client = new TurbineClient(
+            { pool, dialect: mysqlDialect, preparedStatements: false, ...silent },
+            schema,
+          );
+          return { schema, rows: await runQuery(client, c.query) };
         } finally {
           await raw.query(`DROP DATABASE \`${database}\``);
           await raw.end();
@@ -1071,8 +1191,17 @@ for (const h of HARNESSES) {
     for (const [index, c] of CASES.entries()) {
       const skip = h.name === 'code-first' && c.noCodeFirst ? c.noCodeFirst : false;
       it(c.name, { skip }, async () => {
-        const actual = normalize(await h.introspect(c, index));
+        const { schema, rows } = await h.introspect(c, index);
+        const actual = normalize(schema);
         if (process.env.RELATION_PARITY_DUMP) console.log(JSON.stringify({ engine: h.name, case: c.name, actual }));
+        // Rows first: a relation that selects another parent is the failure that matters.
+        if (c.query && rows !== undefined) {
+          assert.deepEqual(
+            JSON.parse(JSON.stringify(rows)),
+            c.query.rows,
+            `${h.name} reads other rows for "${c.name}"`,
+          );
+        }
         const expected = c.differsOn?.engine === h.name ? c.differsOn.expected : c.expected;
         assert.deepEqual(actual, expected, `${h.name} derives different relations for "${c.name}"`);
       });
@@ -1211,6 +1340,37 @@ describe('relation derivation parity: constraint names', () => {
       't_a_fkey2',
       't_a_fkey3',
     ]);
+  });
+
+  it('reserves every constraint name a SQLite statement declares, as PostgreSQL 18 does, but not a named DEFAULT', () => {
+    // Read from pg_constraint on PostgreSQL 18: a named NOT NULL, UNIQUE and
+    // CHECK hold their names; a name on DEFAULT creates no constraint.
+    const ddl =
+      'CREATE TABLE t (a INT CONSTRAINT t_a_fkey NOT NULL, b INT CONSTRAINT t_b_fkey DEFAULT 0, ' +
+      'c INT CONSTRAINT t_c_fkey UNIQUE, d INT, CONSTRAINT t_d_fkey CHECK (d > 0), FOREIGN KEY (a) REFERENCES p, ' +
+      'FOREIGN KEY (b) REFERENCES p, FOREIGN KEY (c) REFERENCES p, FOREIGN KEY (d) REFERENCES p)';
+    assert.deepEqual(
+      nameKeys(ddl, [pragmaKey(['a'], 'p'), pragmaKey(['b'], 'p'), pragmaKey(['c'], 'p'), pragmaKey(['d'], 'p')]),
+      ['t_a_fkey1', 't_b_fkey', 't_c_fkey1', 't_d_fkey1'],
+    );
+  });
+
+  it('cuts explicit and reserved names to 63 bytes of UTF-8, as PostgreSQL stores them', () => {
+    assert.equal(postgresIdentifier(`fk_${'a'.repeat(61)}`), `fk_${'a'.repeat(60)}`);
+    // 65 bytes of two-byte characters keep 63: the last whole character fits in 62.
+    assert.equal(postgresIdentifier(`fk_${'é'.repeat(31)}`), `fk_${'é'.repeat(30)}`);
+    assert.equal(postgresIdentifier(`${'€'.repeat(21)}x`), '€'.repeat(21));
+    // A 64-byte CHECK name that cuts to a key's 63-byte default holds it, and
+    // an explicit name keeps its first 63 bytes.
+    const column = 'c'.repeat(70);
+    const fullDefault = defaultForeignKeyConstraintName('t', [column]);
+    assert.equal(fullDefault.length, 63);
+    assert.deepEqual(
+      foreignKeyConstraintNames('t', [{ columns: [column], name: undefined }], new Set(), [`${fullDefault}x`]),
+      [defaultForeignKeyConstraintName('t', [column], new Set([fullDefault]))],
+    );
+    const long = `t_a_fkey${'z'.repeat(56)}`;
+    assert.deepEqual(foreignKeyConstraintNames('t', [{ columns: ['a'], name: long }], new Set()), [long.slice(0, 63)]);
   });
 
   it('reserves every explicit name before choosing a default, wherever it is declared', () => {

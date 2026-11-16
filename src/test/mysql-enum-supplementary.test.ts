@@ -105,7 +105,8 @@ describe('introspectMysqlWith never writes: a suspect ENUM is marked and its lab
     const schema = await introspectMysqlWith(exec, 'app', { logger });
     assert.equal(Object.hasOwn(schema.enums, 'tickets.mood'), false);
     assert.equal(moodColumn(schema).enumLabelsUnrecoverable, true);
-    assert.equal(statements.length, 5);
+    // Tables, columns, primary keys, foreign keys, constraint names, indexes.
+    assert.equal(statements.length, 6);
     assert.ok(
       statements.every((sql) => /^SELECT\b/.test(sql) && sql.includes('information_schema')),
       statements.join('\n'),

@@ -48,6 +48,7 @@ class Request {
     }
     if (sql.includes('INFORMATION_SCHEMA.KEY_COLUMN_USAGE'))
       return { recordset: [{ TABLE_NAME: 'users', COLUMN_NAME: 'id', ORDINAL_POSITION: 1 }] };
+    if (sql.includes('sys.check_constraints')) return { recordset: [] };
     if (sql.includes('sys.foreign_keys'))
       return {
         recordset: [
