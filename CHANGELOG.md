@@ -1,6 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.95.0 (2026-11-16)
+
+One relation derivation for every engine. PostgreSQL, SQLite (`node:sqlite`
+and better-sqlite3), MySQL, SQL Server, local libSQL, D1 and `defineSchema`
+now turn a schema into relations through the same function, so the same
+tables give the same relation names, to-one and to-many cardinality,
+many-to-many detection and referential actions everywhere. PostgreSQL's
+output is unchanged except for one wrong-results fix: an automatic
+many-to-many through a junction key that references a non-primary-key
+column is no longer derived. Root `dependencies` is still exactly
+`{ "pg": "^8.15.0" }`.
 
 ### Behaviour changes
 
@@ -73,7 +83,7 @@
   now travel with each foreign key on every engine, so two keys can share a
   name without sharing an action.
 
-### Bundle size
+### Changed
 
 - **Three limits rise.** The main barrel goes from 154 to 156 kB brotli,
   `turbine-orm/mssql` from 131 to 138 kB, and `turbine-orm/libsql/introspect`
