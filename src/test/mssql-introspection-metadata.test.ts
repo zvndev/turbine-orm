@@ -96,6 +96,69 @@ describe('SQL Server catalog metadata fidelity', () => {
     assert.deepEqual(Object.keys(filtered.tables.parents!.relations), []);
   });
 
+  it('names system-named composite keys as PostgreSQL would, after explicit names, whatever their suffixes', async () => {
+    const f = catalogFixture();
+    f.tables.push('cn_parents', 'cn_links', 'cn_returns');
+    for (const [table, names] of [
+      ['cn_parents', ['a', 'b', 'c', 'd']],
+      ['cn_links', ['x', 'y']],
+      ['cn_returns', ['tenant', 'x', 'y']],
+    ] as const)
+      for (const name of names) f.columns.push(catalogColumn(table, name));
+    f.primary.push(
+      { TABLE_NAME: 'cn_parents', COLUMN_NAME: 'a', ORDINAL_POSITION: 1 },
+      { TABLE_NAME: 'cn_parents', COLUMN_NAME: 'b', ORDINAL_POSITION: 2 },
+    );
+    f.indexes.push(...catalogIndex('cn_parents', 'UQ_cn_parents_cd', ['c', 'd']));
+    const fk = (
+      table: string,
+      child: string[],
+      target: string[],
+      name: string,
+      extra: Record<string, unknown> = {},
+    ) => {
+      for (const [i, column] of child.entries())
+        f.foreign.push({
+          TABLE_NAME: table,
+          COLUMN_NAME: column,
+          REFERENCED_TABLE_NAME: 'cn_parents',
+          REFERENCED_COLUMN_NAME: target[i],
+          TABLE_SCHEMA: 'app',
+          REFERENCED_TABLE_SCHEMA: 'app',
+          CONSTRAINT_NAME: name,
+          ORDINAL_POSITION: i + 1,
+          ...extra,
+        });
+    };
+    // Pushed in the catalog's order, by constraint name. The random suffixes put
+    // the key to (c, d) first; SQL Server records no declaration order, so the
+    // key to (a, b) takes the default name.
+    fk('cn_links', ['x', 'y'], ['c', 'd'], 'FK__cn_links__x__0BAD', { IS_SYSTEM_NAMED: true });
+    fk('cn_links', ['x', 'y'], ['a', 'b'], 'FK__cn_links__x__F00D', { IS_SYSTEM_NAMED: true });
+    // A system-named key whose default an explicit name already holds.
+    fk('cn_returns', ['tenant', 'y'], ['a', 'b'], 'FK__cn_return__tenan__1234', {
+      IS_SYSTEM_NAMED: true,
+      DELETE_RULE: 'CASCADE',
+    });
+    fk('cn_returns', ['tenant', 'x'], ['a', 'b'], 'cn_returns_tenant_y_fkey');
+    const schema = await introspectMssqlWith(f.exec, 'app', { logger: {} });
+    const keys = (table: string) =>
+      Object.fromEntries(
+        Object.entries(schema.tables[table]!.relations).map(([name, r]) => [
+          name,
+          [r.foreignKey, r.referenceKey, r.onDelete ?? null],
+        ]),
+      );
+    assert.deepEqual(keys('cn_links'), {
+      cnLinksXY: [['x', 'y'], ['a', 'b'], null],
+      cnLinksXYFkey1: [['x', 'y'], ['c', 'd'], null],
+    });
+    assert.deepEqual(keys('cn_returns'), {
+      cnReturnsTenantY: [['tenant', 'x'], ['a', 'b'], null],
+      cnReturnsTenantYFkey1: [['tenant', 'y'], ['a', 'b'], 'cascade'],
+    });
+  });
+
   it('uses enforced plain unique keys for to-one, named as PostgreSQL names it, and the legacy opt-out', async () => {
     const f = catalogFixture();
     const schema = await introspectMssqlWith(f.exec, 'app', { logger: {} });

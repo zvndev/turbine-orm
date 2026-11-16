@@ -90,6 +90,8 @@ interface Case {
   noCodeFirst?: string;
   /** What PostgreSQL derives, the reference every engine is held to. */
   expected: Relations;
+  /** One engine that derives something else, for a reason docs/relation-names.md states, and what it derives. */
+  differsOn?: { engine: string; expected: Relations };
 }
 
 const upperFirst = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
@@ -142,6 +144,7 @@ const LONG_A = `${'shipment_reference_'.repeat(3)}one`;
 const LONG_B = `${'shipment_reference_'.repeat(3)}two`;
 /** As much of `links_x_<column>` as PostgreSQL keeps when it adds `_fkey`. */
 const LONG_BASE = 'linksXShipmentReferenceShipmentReferenceShipmentRef';
+const TAG_COLUMNS = [...'abcdefghi'].map((c) => `tag_${c}_id`);
 const cascade = (relation: NormRelation): NormRelation => ({ ...relation, onDelete: 'cascade' });
 
 const CASES: Case[] = [
@@ -428,6 +431,67 @@ const CASES: Case[] = [
     },
   },
   {
+    // PostgreSQL names the unnamed key `returns_tenant_y_fkey1`, because the
+    // explicit name is taken. It refuses the statement if the explicit name is
+    // declared after the key whose default it is.
+    name: "an explicit constraint name equal to another key's default name",
+    tables: [
+      ORDERS_AB,
+      t('returns', [int('tenant'), int('x'), int('y')], {
+        primaryKey: [],
+        foreignKeys: [
+          fk(['tenant', 'x'], 'orders', AB, { name: 'returns_tenant_y_fkey' }),
+          fk(['tenant', 'y'], 'orders', AB, { onDelete: 'cascade' }),
+        ],
+      }),
+    ],
+    noCodeFirst: 'defineSchema `references` is single-column',
+    expected: {
+      returns: {
+        returnsTenantY: belongsTo('orders', ['tenant', 'x'], AB),
+        returnsTenantYFkey1: cascade(belongsTo('orders', ['tenant', 'y'], AB)),
+      },
+      orders: {
+        returnsByReturnsTenantY: hasMany('returns', ['tenant', 'x'], AB),
+        returnsByReturnsTenantYFkey1: cascade(hasMany('returns', ['tenant', 'y'], AB)),
+      },
+    },
+  },
+  {
+    name: 'explicit constraint names in the form MySQL generates',
+    tables: [
+      ORDERS_AB,
+      t('returns', [int('x'), int('y'), int('z')], {
+        primaryKey: [],
+        foreignKeys: [
+          fk(XY, 'orders', AB, { name: 'returns_ibfk_1' }),
+          fk(['x', 'z'], 'orders', AB, { name: 'returns_ibfk_2' }),
+        ],
+      }),
+    ],
+    noCodeFirst: 'defineSchema `references` is single-column',
+    expected: {
+      returns: { returnsIbfk_1: belongsTo('orders', XY, AB), returnsIbfk_2: belongsTo('orders', ['x', 'z'], AB) },
+      orders: {
+        returnsByReturnsIbfk_1: hasMany('returns', XY, AB),
+        returnsByReturnsIbfk_2: hasMany('returns', ['x', 'z'], AB),
+      },
+    },
+    // MySQL's catalog keeps no flag for a name it generated, and it generates
+    // exactly these, so both read as unnamed keys and take PostgreSQL's
+    // default names.
+    differsOn: {
+      engine: 'mysql',
+      expected: {
+        returns: { returnsXY: belongsTo('orders', XY, AB), returnsXZ: belongsTo('orders', ['x', 'z'], AB) },
+        orders: {
+          returnsByReturnsXY: hasMany('returns', XY, AB),
+          returnsByReturnsXZ: hasMany('returns', ['x', 'z'], AB),
+        },
+      },
+    },
+  },
+  {
     // Both default to `links_x_y_fkey`; the first declared keeps it and the
     // second takes `links_x_y_fkey1`. Declared the other way round (next case),
     // the names change places, on PostgreSQL and so everywhere.
@@ -469,6 +533,37 @@ const CASES: Case[] = [
         [`linksBy${upperFirst(LONG_BASE)}`]: hasMany('links', ['x', LONG_A], AB),
         [`linksBy${upperFirst(LONG_BASE.slice(0, -1))}Fkey1`]: hasMany('links', ['x', LONG_B], AB),
       },
+    },
+  },
+  {
+    // MySQL numbers unnamed keys `links_ibfk_1` to `links_ibfk_11` in
+    // declaration order, and its catalog lists `links_ibfk_10` before
+    // `links_ibfk_2`.
+    name: 'more than nine unnamed foreign keys from one table',
+    tables: [
+      PARENTS_AB_CD,
+      t('tags', [id()]),
+      t('links', [int('x'), int('y'), ...TAG_COLUMNS.map((c) => int(c))], {
+        primaryKey: [],
+        foreignKeys: [
+          fk(TAG_COLUMNS[0]!, 'tags'),
+          fk(XY, 'parents', CD),
+          ...TAG_COLUMNS.slice(1).map((c) => fk(c, 'tags')),
+          fk(XY, 'parents', AB),
+        ],
+      }),
+    ],
+    noCodeFirst: 'defineSchema `references` is single-column',
+    expected: {
+      links: {
+        linksXY: belongsTo('parents', XY, CD),
+        linksXYFkey1: belongsTo('parents', XY, AB),
+        ...Object.fromEntries(TAG_COLUMNS.map((c) => [snakeToCamel(c.slice(0, -3)), belongsTo('tags', c)])),
+      },
+      parents: { linksByLinksXY: hasMany('links', XY, CD), linksByLinksXYFkey1: hasMany('links', XY, AB) },
+      tags: Object.fromEntries(
+        TAG_COLUMNS.map((c) => [`linksBy${upperFirst(snakeToCamel(c.slice(0, -3)))}`, hasMany('links', c)]),
+      ),
     },
   },
   {
@@ -978,7 +1073,8 @@ for (const h of HARNESSES) {
       it(c.name, { skip }, async () => {
         const actual = normalize(await h.introspect(c, index));
         if (process.env.RELATION_PARITY_DUMP) console.log(JSON.stringify({ engine: h.name, case: c.name, actual }));
-        assert.deepEqual(actual, c.expected, `${h.name} derives different relations for "${c.name}"`);
+        const expected = c.differsOn?.engine === h.name ? c.differsOn.expected : c.expected;
+        assert.deepEqual(actual, expected, `${h.name} derives different relations for "${c.name}"`);
       });
     }
   });

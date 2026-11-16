@@ -105,8 +105,10 @@ import {
 import {
   applyTableFilters,
   assertDistinctColumnFields,
-  defaultForeignKeyConstraintName,
+  compareCatalogNames,
   deriveRelations,
+  type ForeignKeyEntry,
+  foreignKeyConstraintNames,
   nullRecord,
   type RelationCatalogFacts,
   referentialActionFromCatalog,
@@ -118,7 +120,6 @@ import {
   type ColumnMetadata,
   type IndexMetadata,
   isDateType,
-  type ReferentialAction,
   type RelationDef,
   type SchemaMetadata,
   snakeToCamel,
@@ -1759,14 +1760,6 @@ interface InfoIndex {
 
 const num = (v: number | string | null | undefined): number => (typeof v === 'string' ? Number(v) : (v ?? 0));
 
-interface FKEntry {
-  sourceTable: string;
-  sourceColumns: string[];
-  targetTable: string;
-  targetColumns: string[];
-  constraintName: string;
-}
-
 /**
  * Derive relations through the ONE relation derivation every engine calls
  * (`deriveRelations` in catalog-metadata.ts), so this engine derives the
@@ -1983,13 +1976,13 @@ export async function introspectMysqlWith(
      ORDER BY k.CONSTRAINT_NAME, k.ORDINAL_POSITION`,
     [schema],
   )) as unknown as InfoFk[];
-  const fkByConstraint = new Map<string, FKEntry>();
-  const fkActions = new Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
+  const fkByTable = new Map<string, Map<string, ForeignKeyEntry>>();
   for (const r of fkRows) {
     if (!tableSet.has(r.TABLE_NAME)) continue;
     if (r.REFERENCED_TABLE_SCHEMA !== undefined && r.REFERENCED_TABLE_SCHEMA !== schema) continue;
-    const key = JSON.stringify([r.TABLE_NAME, r.CONSTRAINT_NAME]);
-    let entry = fkByConstraint.get(key);
+    if (!fkByTable.has(r.TABLE_NAME)) fkByTable.set(r.TABLE_NAME, new Map());
+    const table = fkByTable.get(r.TABLE_NAME)!;
+    let entry = table.get(r.CONSTRAINT_NAME);
     if (!entry) {
       entry = {
         sourceTable: r.TABLE_NAME,
@@ -1997,29 +1990,40 @@ export async function introspectMysqlWith(
         targetTable: r.REFERENCED_TABLE_NAME,
         targetColumns: [],
         constraintName: r.CONSTRAINT_NAME,
+        actions: {
+          onDelete: referentialActionFromCatalog(r.DELETE_RULE),
+          onUpdate: referentialActionFromCatalog(r.UPDATE_RULE),
+        },
       };
-      fkByConstraint.set(key, entry);
-      fkActions.set(key, {
-        onDelete: referentialActionFromCatalog(r.DELETE_RULE),
-        onUpdate: referentialActionFromCatalog(r.UPDATE_RULE),
-      });
+      table.set(r.CONSTRAINT_NAME, entry);
     }
     entry.sourceColumns.push(r.COLUMN_NAME);
     entry.targetColumns.push(r.REFERENCED_COLUMN_NAME);
   }
-  // A constraint InnoDB named itself (`<table>_ibfk_<n>`) takes the name
-  // PostgreSQL would have given it, which is what relation naming reads for a
-  // composite FK. Actions are re-keyed "<table>::<constraint>" to match.
-  const relationActions = new Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
+  // Relation naming reads a composite FK's constraint name, so each key takes
+  // the name PostgreSQL gives the same declarations. A name InnoDB generated,
+  // `<table>_ibfk_<n>`, numbers the unnamed keys in declaration order (the
+  // catalog lists `_ibfk_10` before `_ibfk_2`), and each takes PostgreSQL's
+  // default in that order. The catalog cannot tell an explicit name in that
+  // form from a generated one, so it reads as generated.
   const constraintNames = new Set<string>();
-  for (const [key, entry] of fkByConstraint) {
-    const generated = `${entry.sourceTable}_ibfk_`;
-    if (entry.constraintName.startsWith(generated) && /^\d+$/.test(entry.constraintName.slice(generated.length))) {
-      entry.constraintName = defaultForeignKeyConstraintName(entry.sourceTable, entry.sourceColumns, constraintNames);
-    }
-    relationActions.set(`${entry.sourceTable}::${entry.constraintName}`, fkActions.get(key)!);
+  const foreignKeys: ForeignKeyEntry[] = [];
+  for (const [table, entries] of [...fkByTable].sort(([a], [b]) => compareCatalogNames(a, b))) {
+    const keys = [...entries.values()].map((fk) => {
+      const n = fk.constraintName.slice(table.length + 6);
+      return { fk, n: fk.constraintName.startsWith(`${table}_ibfk_`) && /^\d+$/.test(n) ? Number(n) : -1 };
+    });
+    keys.sort((a, b) => a.n - b.n);
+    const names = foreignKeyConstraintNames(
+      table,
+      keys.map(({ fk, n }) => ({ columns: fk.sourceColumns, name: n < 0 ? fk.constraintName : undefined })),
+      constraintNames,
+    );
+    keys.forEach(({ fk }, i) => {
+      fk.constraintName = names[i]!;
+      if (tableSet.has(fk.targetTable)) foreignKeys.push(fk);
+    });
   }
-  const foreignKeys = [...fkByConstraint.values()].filter((fk) => tableSet.has(fk.targetTable));
 
   // ----- Indexes + unique constraints -----
   const idxRows = (await exec(
@@ -2099,7 +2103,6 @@ export async function introspectMysqlWith(
     junctionKeysByTable: new Map(
       Array.from(uniqueByTable, ([table, keys]) => [table, keys.filter((key) => key.length === 2)]),
     ),
-    fkActions: relationActions,
     ...(options.legacyToManyUniques ? { legacyToManyUniques: true } : {}),
     ...(options.logger ? { logger: options.logger } : {}),
   });

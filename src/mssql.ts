@@ -135,8 +135,10 @@ import {
   applyTableFilters,
   assertDistinctColumnFields,
   type IntrospectOptions as CatalogIntrospectOptions,
-  defaultForeignKeyConstraintName,
+  compareCatalogNames,
   deriveRelations,
+  type ForeignKeyEntry,
+  foreignKeyConstraintNames,
   nullRecord,
   type RelationCatalogFacts,
   referentialActionFromCatalog,
@@ -150,7 +152,6 @@ import {
   type IndexMetadata,
   isDateType,
   normalizeKeyColumns,
-  type ReferentialAction,
   type RelationDef,
   type SchemaMetadata,
   snakeToCamel,
@@ -1796,14 +1797,6 @@ function buildForJsonManyToMany(dialect: Dialect, ctx: RelationSubqueryContext, 
 /** Async executor that returns plain row objects for a parameterized (`@pN`) query. */
 export type MssqlRowExecutor = (sql: string, params: unknown[]) => Promise<Record<string, unknown>[]>;
 
-interface FKEntry {
-  sourceTable: string;
-  sourceColumns: string[];
-  targetTable: string;
-  targetColumns: string[];
-  constraintName: string;
-}
-
 const num = (v: number | string | null | undefined): number => (typeof v === 'string' ? Number(v) : (v ?? 0));
 
 /**
@@ -1990,8 +1983,7 @@ export async function introspectMssqlWith(
      ORDER BY fk.name, fkc.constraint_column_id`,
     [schema],
   );
-  const fkByConstraint = new Map<string, FKEntry>();
-  const fkFacts = new Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction; systemNamed: boolean }>();
+  const fkByTable = new Map<string, Map<string, { fk: ForeignKeyEntry; systemNamed: boolean }>>();
   for (const r of fkRows.sort((a, b) => Number(a.ORDINAL_POSITION) - Number(b.ORDINAL_POSITION))) {
     const sourceTable = String(r.TABLE_NAME);
     const targetTable = String(r.REFERENCED_TABLE_NAME);
@@ -2003,37 +1995,56 @@ export async function introspectMssqlWith(
     )
       continue;
     const constraintName = String(r.CONSTRAINT_NAME);
-    const key = JSON.stringify([sourceTable, constraintName]);
-    let entry = fkByConstraint.get(key);
-    if (!entry) {
-      entry = { sourceTable, sourceColumns: [], targetTable, targetColumns: [], constraintName };
-      fkByConstraint.set(key, entry);
-      fkFacts.set(key, {
-        onDelete: referentialActionFromCatalog(r.DELETE_RULE),
-        onUpdate: referentialActionFromCatalog(r.UPDATE_RULE),
+    if (!fkByTable.has(sourceTable)) fkByTable.set(sourceTable, new Map());
+    const table = fkByTable.get(sourceTable)!;
+    let key = table.get(constraintName);
+    if (!key) {
+      key = {
+        fk: {
+          sourceTable,
+          sourceColumns: [],
+          targetTable,
+          targetColumns: [],
+          constraintName,
+          actions: {
+            onDelete: referentialActionFromCatalog(r.DELETE_RULE),
+            onUpdate: referentialActionFromCatalog(r.UPDATE_RULE),
+          },
+        },
         systemNamed: bitIsTrue(r.IS_SYSTEM_NAMED),
-      });
+      };
+      table.set(constraintName, key);
     }
-    entry.sourceColumns.push(String(r.COLUMN_NAME));
-    entry.targetColumns.push(String(r.REFERENCED_COLUMN_NAME));
+    key.fk.sourceColumns.push(String(r.COLUMN_NAME));
+    key.fk.targetColumns.push(String(r.REFERENCED_COLUMN_NAME));
   }
-  // A system-named constraint (`FK__orders__tenan__1A2B3C4D`, with a random
-  // suffix) takes the name PostgreSQL would have given it, so a composite FK's
-  // relation name is the same on every database and on every engine. Actions
-  // are keyed "<table>::<constraint>" to match.
-  const relationActions = new Map<string, { onDelete: ReferentialAction; onUpdate: ReferentialAction }>();
+  // Relation naming reads a composite FK's constraint name. A system-named
+  // constraint (`FK__orders__tenan__1A2B3C4D`, with a random suffix) takes the
+  // name PostgreSQL would have given it, so that relation is named the same on
+  // every database and on every engine; an explicit name is reserved first.
+  // SQL Server records no declaration order, so system-named keys are named in
+  // the order of their columns and what they reference, never of the suffix.
   const constraintNames = new Set<string>();
-  for (const [key, entry] of fkByConstraint) {
-    const facts = fkFacts.get(key)!;
-    if (facts.systemNamed) {
-      entry.constraintName = defaultForeignKeyConstraintName(entry.sourceTable, entry.sourceColumns, constraintNames);
-    }
-    relationActions.set(`${entry.sourceTable}::${entry.constraintName}`, {
-      onDelete: facts.onDelete,
-      onUpdate: facts.onUpdate,
+  const foreignKeys: ForeignKeyEntry[] = [];
+  const identity = ({ fk }: { fk: ForeignKeyEntry }) =>
+    JSON.stringify([fk.sourceColumns, fk.targetTable, fk.targetColumns]);
+  for (const [table, entries] of [...fkByTable].sort(([a], [b]) => compareCatalogNames(a, b))) {
+    const keys = [...entries.values()].sort(
+      (a, b) => Number(a.systemNamed) - Number(b.systemNamed) || compareCatalogNames(identity(a), identity(b)),
+    );
+    const names = foreignKeyConstraintNames(
+      table,
+      keys.map(({ fk, systemNamed }) => ({
+        columns: fk.sourceColumns,
+        name: systemNamed ? undefined : fk.constraintName,
+      })),
+      constraintNames,
+    );
+    keys.forEach(({ fk }, i) => {
+      fk.constraintName = names[i]!;
+      if (tableSet.has(fk.targetTable)) foreignKeys.push(fk);
     });
   }
-  const foreignKeys = [...fkByConstraint.values()].filter((fk) => tableSet.has(fk.targetTable));
 
   // ----- Indexes + unique constraints -----
   const idxRows = await exec(
@@ -2162,7 +2173,6 @@ export async function introspectMssqlWith(
     junctionKeysByTable: new Map(
       Array.from(uniqueByTable, ([table, keys]) => [table, keys.filter((key) => key.length === 2)]),
     ),
-    fkActions: relationActions,
     ...(options.legacyToManyUniques ? { legacyToManyUniques: true } : {}),
     ...(options.logger ? { logger: options.logger } : {}),
   });
