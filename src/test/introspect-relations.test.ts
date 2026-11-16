@@ -549,7 +549,11 @@ describe('addAutoManyToManyRelations, column-shadow handling', () => {
       addAutoManyToManyRelations(
         ['users', 'organizations', '_UserOrganizations'],
         fks,
-        new Map(), // no primary keys anywhere
+        // The junction has no primary key; each key references its target's.
+        new Map([
+          ['users', ['id']],
+          ['organizations', ['id']],
+        ]),
         new Map([['_UserOrganizations', ['A', 'B']]]),
         relationsByTable,
         undefined,

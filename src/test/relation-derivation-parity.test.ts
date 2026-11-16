@@ -661,6 +661,27 @@ const CASES: Case[] = [
     },
   },
   {
+    // The automatic many-to-many joins the junction to the target's primary
+    // key, so through a key that references another unique column
+    // (`tags.code`) it returned tags the junction does not reference. No
+    // engine derives it.
+    name: 'junction table whose foreign key references a non-primary-key column',
+    tables: [
+      t('posts', [id()]),
+      t('tags', [id(), int('code', { unique: true })]),
+      t('links', [int('post_id', { notNull: true }), int('tag_code', { notNull: true })], {
+        primaryKey: [],
+        unique: [['post_id', 'tag_code']],
+        foreignKeys: [fk('post_id', 'posts'), fk('tag_code', 'tags', 'code')],
+      }),
+    ],
+    expected: {
+      posts: { links: hasMany('links', 'post_id') },
+      tags: { links: hasMany('links', 'tag_code', 'code') },
+      links: { post: belongsTo('posts', 'post_id'), tag: belongsTo('tags', 'tag_code', 'code') },
+    },
+  },
+  {
     name: 'junction table, pure',
     tables: [
       t('posts', [id(), text('title')]),

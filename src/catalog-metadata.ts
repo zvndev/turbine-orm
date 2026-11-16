@@ -640,6 +640,10 @@ export function buildRelationsFromForeignKeys(
  *   3. Each FK's source column is one of J's two key columns.
  *   4. The two FKs target two DISTINCT tables (A and B).
  *   5. J has no payload columns beyond the two FK/key columns.
+ *   6. Each FK references exactly its target's primary key. The query joins
+ *      the junction to the target's primary key, so any other referenced
+ *      column would return rows the junction does not reference. An explicit
+ *      `manyToMany` declaration is not affected.
  *
  * For such a J linking A and B this ADDS a `manyToMany` on A → B and B → A
  * routed `through` J. It never removes or renames an existing relation:
@@ -689,6 +693,16 @@ export function addAutoManyToManyRelations(
     // Two DISTINCT target tables.
     const [fkA, fkB] = tableFks as [ForeignKeyEntry, ForeignKeyEntry];
     if (fkA.targetTable === fkB.targetTable) continue;
+
+    // Each key references its target's primary key. The many-to-many query
+    // joins the junction to the target's PRIMARY KEY, so through a key to
+    // another unique column (`tag_code REFERENCES tags (code)`) it returned
+    // tags the junction does not reference.
+    const referencesPrimaryKey = (fk: ForeignKeyEntry) => {
+      const pk = pkByTable.get(fk.targetTable) ?? [];
+      return pk.length === fk.targetColumns.length && pk.every((c, i) => c === fk.targetColumns[i]);
+    };
+    if (!referencesPrimaryKey(fkA) || !referencesPrimaryKey(fkB)) continue;
 
     // No payload columns: J's columns are exactly the two FK/key columns.
     const jCols = columnNamesByTable.get(tableName) ?? [];
