@@ -126,7 +126,11 @@ import {
   type TableMetadata,
 } from './schema.js';
 import { rewritePositionalPlaceholders } from './sql-placeholders.js';
-import { nameSqliteForeignKeys } from './sqlite-constraint-names.js';
+import {
+  canonicalSqliteForeignKeyColumns,
+  nameSqliteForeignKeys,
+  sqliteCatalogName,
+} from './sqlite-constraint-names.js';
 
 export { sqliteTypeToTs } from './d1/sqlite-dialect.js';
 
@@ -1844,7 +1848,8 @@ export function introspectSqliteDatabase(
         entry = {
           sourceTable: tableName,
           sourceColumns: [],
-          targetTable: fk.table,
+          // The catalog keeps the spelling the REFERENCES clause used.
+          targetTable: sqliteCatalogName(tableNames, fk.table) ?? fk.table,
           targetColumns: [],
           constraintName: '',
           actions: {
@@ -1916,6 +1921,10 @@ export function introspectSqliteDatabase(
     uniqueByTable.set(tableName, uniques);
     relationUniqueByTable.set(tableName, relationUniques);
   }
+
+  // The referenced columns as the catalog spells them, so the relations, the
+  // junction test and the comparison test all read one spelling.
+  canonicalSqliteForeignKeyColumns(foreignKeys, (table) => columnsByTable.get(table));
 
   // ----- Build relations from foreign keys (belongsTo + hasMany + m2m) -----
   // Delegated to the ONE relation derivation every engine calls, so SQLite

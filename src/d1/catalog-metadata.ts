@@ -22,7 +22,11 @@ import {
   snakeToCamel,
   type TableMetadata,
 } from '../schema.js';
-import { nameSqliteForeignKeys } from '../sqlite-constraint-names.js';
+import {
+  canonicalSqliteForeignKeyColumns,
+  nameSqliteForeignKeys,
+  sqliteCatalogName,
+} from '../sqlite-constraint-names.js';
 import { CATALOG_TABLES, CATALOG_VIEWS, type D1CatalogSnapshot, literal, q } from './catalog.js';
 import type { D1IntrospectOptions } from './introspect.js';
 import { sqliteTypeToTs } from './sqlite-dialect.js';
@@ -32,7 +36,6 @@ function d1ColumnType(declared: string, nullable: boolean): string {
   if (/^(numeric|decimal)/i.test(declared)) return nullable ? 'number | string | null' : 'number | string';
   return sqliteTypeToTs(declared, nullable);
 }
-const sqliteName = (name: string) => name.replace(/[A-Z]/g, (letter) => letter.toLowerCase());
 
 function isSqliteDateType(type: string): boolean {
   return isDateType(type.toLowerCase()) || /(timestamp|datetime|date)/i.test(type);
@@ -155,7 +158,7 @@ export function d1CatalogMetadata(snapshot: D1CatalogSnapshot, options: D1Intros
         entry = {
           sourceTable: tableName,
           sourceColumns: [],
-          targetTable: tableNames.find((name) => sqliteName(name) === sqliteName(fk.table)) ?? fk.table,
+          targetTable: sqliteCatalogName(tableNames, fk.table) ?? fk.table,
           targetColumns: [],
           constraintName: '',
           actions: {
@@ -234,16 +237,9 @@ export function d1CatalogMetadata(snapshot: D1CatalogSnapshot, options: D1Intros
 
   // SQLite resolves FK identifiers with ASCII case folding. Preserve the actual
   // catalog spelling in metadata and refuse unresolved in-scope references.
-  for (const fk of foreignKeys) {
-    const resolve = (table: string, name: string): string => {
-      const column = columnsByTable.get(table)?.find((c) => sqliteName(c.name) === sqliteName(name));
-      if (!column)
-        throw new ValidationError(`Unresolvable D1 foreign key: ${printableCatalogName(fk.constraintName)}.`);
-      return column.name;
-    };
-    fk.sourceColumns = fk.sourceColumns.map((name) => resolve(fk.sourceTable, name));
-    fk.targetColumns = fk.targetColumns.map((name) => resolve(fk.targetTable, name));
-  }
+  const [unresolved] = canonicalSqliteForeignKeyColumns(foreignKeys, (table) => columnsByTable.get(table));
+  if (unresolved)
+    throw new ValidationError(`Unresolvable D1 foreign key: ${printableCatalogName(unresolved.constraintName)}.`);
 
   // ----- Build relations from foreign keys (belongsTo + hasMany + m2m) -----
   // The ONE relation derivation every engine calls, with SQLite's own facts:

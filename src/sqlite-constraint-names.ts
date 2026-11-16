@@ -1,5 +1,6 @@
 /**
- * Foreign-key constraint names for SQLite tables.
+ * Foreign-key constraint names, and the spelling of foreign-key identifiers,
+ * for SQLite tables.
  *
  * SQLite keeps no constraint name in its catalog (`PRAGMA foreign_key_list` has
  * no name column), only in the statement text `sqlite_master.sql` stores. A
@@ -246,4 +247,43 @@ export function nameSqliteForeignKeys(
   ordered.forEach((k, i) => {
     k.constraintName = names[i]!;
   });
+}
+
+/** `name` as `names` spell it, compared as SQLite compares identifiers; undefined when none matches. */
+export const sqliteCatalogName = (names: readonly string[], name: string): string | undefined =>
+  names.find((candidate) => fold(candidate) === fold(name));
+
+/**
+ * Rewrites every key's child and referenced columns to the spelling their
+ * table's catalog gives them, and returns the keys that name a column a known
+ * table does not have. `PRAGMA foreign_key_list` keeps the spelling the
+ * REFERENCES clause used (`REFERENCES posts (ID)` for the column `id`), and
+ * SQLite compares identifiers ignoring ASCII case, so without this a junction
+ * key to the primary key did not read as one, nor a unique key's parent column
+ * as that column. Each introspector also looks a key's target table up with
+ * {@link sqliteCatalogName}.
+ *
+ * @param columnsOf a table's columns, undefined for a table that was not read
+ */
+export function canonicalSqliteForeignKeyColumns(
+  keys: readonly ForeignKeyEntry[],
+  columnsOf: (table: string) => readonly { name: string }[] | undefined,
+): ForeignKeyEntry[] {
+  const unresolved = new Set<ForeignKeyEntry>();
+  for (const fk of keys) {
+    const spell = (table: string, name: string) => {
+      const columns = columnsOf(table);
+      const found =
+        columns &&
+        sqliteCatalogName(
+          columns.map((c) => c.name),
+          name,
+        );
+      if (columns && found === undefined) unresolved.add(fk);
+      return found ?? name;
+    };
+    fk.sourceColumns = fk.sourceColumns.map((name) => spell(fk.sourceTable, name));
+    fk.targetColumns = fk.targetColumns.map((name) => spell(fk.targetTable, name));
+  }
+  return [...unresolved];
 }

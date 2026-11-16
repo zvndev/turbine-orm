@@ -1279,6 +1279,107 @@ for (const h of HARNESSES) {
 }
 
 // ---------------------------------------------------------------------------
+// SQLite reference spelling. SQLite compares identifiers ignoring ASCII case,
+// and its catalog keeps the spelling each REFERENCES clause used (`POSTS (ID)`)
+// while the tables themselves say `posts (id)`. Not portable (PostgreSQL would
+// read a quoted `"ID"` as another column), so it runs on the SQLite drivers.
+// ---------------------------------------------------------------------------
+
+const SPELLING_EXPECTED: Relations = {
+  links: { post: belongsTo('posts', 'post_id'), tag: belongsTo('tags', 'tag_id') },
+  posts: { links: hasMany('links', 'post_id'), tags: manyToMany('tags', 'links', 'post_id', 'tag_id') },
+  tags: { links: hasMany('links', 'tag_id'), posts: manyToMany('posts', 'links', 'tag_id', 'post_id') },
+  profiles: { user: belongsTo('users', 'user_id') },
+  users: { profile: hasOne('profiles', 'user_id') },
+};
+
+const spellingDdl = (posts: string, id: string) => [
+  'CREATE TABLE posts (id INTEGER PRIMARY KEY)',
+  'CREATE TABLE tags (id INTEGER PRIMARY KEY)',
+  'CREATE TABLE users (id INTEGER PRIMARY KEY)',
+  `CREATE TABLE links (post_id INTEGER REFERENCES ${posts} (${id}), tag_id INTEGER REFERENCES tags (${id}), PRIMARY KEY (post_id, tag_id))`,
+  `CREATE TABLE profiles (id INTEGER PRIMARY KEY, user_id INTEGER UNIQUE REFERENCES users (${id}))`,
+  'INSERT INTO posts VALUES (1)',
+  'INSERT INTO tags VALUES (10)',
+  'INSERT INTO links VALUES (1, 10)',
+  'INSERT INTO users VALUES (5)',
+  'INSERT INTO profiles VALUES (7, 5)',
+];
+
+for (const driver of [
+  {
+    name: 'node:sqlite',
+    runners: skipGate(!DatabaseSync, 'turbine-orm/sqlite requires node:sqlite (Node >= 22.5)'),
+    async read(statements: string[]) {
+      const { introspectSqliteDatabase, turbineSqlite } = await import('../sqlite.js');
+      const db = new DatabaseSync!(':memory:');
+      try {
+        for (const stmt of statements) db.exec(stmt);
+        const schema = introspectSqliteDatabase(db, silent);
+        const client = turbineSqlite(db, schema, silent);
+        try {
+          return { schema, ...(await readSpellingRows(client)) };
+        } finally {
+          await client.disconnect();
+        }
+      } finally {
+        db.close();
+      }
+    },
+  },
+  {
+    name: 'better-sqlite3',
+    runners: skipGate(!BetterSqlite3, 'requires the optional better-sqlite3 peer (set TURBINE_SQLITE_BINDING_PEER)'),
+    async read(statements: string[]) {
+      const { introspectBetterSqlite3Database, turbineBetterSqlite3 } = await import('../better-sqlite3.js');
+      const db = new BetterSqlite3!(':memory:');
+      try {
+        for (const stmt of statements) db.exec(stmt);
+        const schema = introspectBetterSqlite3Database(db, silent);
+        const client = await turbineBetterSqlite3(db, schema, silent);
+        try {
+          return { schema, ...(await readSpellingRows(client)) };
+        } finally {
+          await client.disconnect();
+        }
+      } finally {
+        db.close();
+      }
+    },
+  },
+]) {
+  describe(`SQLite reference spelling: ${driver.name}`, () => {
+    for (const [label, posts, id] of [
+      ['as the tables spell them', 'posts', 'id'],
+      ['with the columns in another case', 'posts', 'ID'],
+      ['with the tables and columns in another case', 'POSTS', 'ID'],
+    ] as const) {
+      driver.runners.it(`a junction and a unique key whose references name the tables ${label}`, async () => {
+        const { schema, posts: postRows, users } = await driver.read(spellingDdl(posts, id));
+        assert.deepEqual(JSON.parse(JSON.stringify(postRows)), [{ id: 1, tags: [{ id: 10 }] }]);
+        assert.deepEqual(JSON.parse(JSON.stringify(users)), [{ id: 5, profile: { id: 7, userId: 5 } }]);
+        assert.deepEqual(normalize(schema), SPELLING_EXPECTED);
+      });
+    }
+  });
+}
+
+// biome-ignore lint/suspicious/noExplicitAny: a SQLite client typed by the metadata only at runtime.
+async function readSpellingRows(client: { table(name: string): any }) {
+  const query = async (table: string, args: Record<string, unknown>) => {
+    try {
+      return await client.table(table).findMany(args);
+    } catch (error) {
+      return { error: (error as Error).message.split('\n')[0] };
+    }
+  };
+  return {
+    posts: await query('posts', { with: { tags: true } }),
+    users: await query('users', { with: { profile: true } }),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Constraint names. A composite foreign key that shares its target is named
 // from its constraint, and the catalogs disagree about unnamed constraints and
 // (SQLite) keep no names at all, so both halves are pinned here.
