@@ -947,3 +947,25 @@ describe('relation derivation parity: constraint names', () => {
     assert.deepEqual(declaredForeignKeyNames(''), []);
   });
 });
+
+describe('defineSchema relation order', () => {
+  it("lists each table's relations in declaration order, not the derivation's sorted order", () => {
+    // Sorted by source table, `comments` comes before `posts`; declared, `posts`
+    // comes first. The names are the same either way, and generated files are
+    // written in this order, so an unchanged schema keeps generating the same files.
+    const meta = schemaDefToMetadata(
+      defineSchema({
+        users: { id: { type: 'serial', primaryKey: true } },
+        posts: { id: { type: 'serial', primaryKey: true }, authorId: { type: 'integer', references: 'users.id' } },
+        comments: {
+          id: { type: 'serial', primaryKey: true },
+          postId: { type: 'integer', references: 'posts.id' },
+          authorId: { type: 'integer', references: 'users.id' },
+        },
+      }),
+    );
+    assert.deepEqual(Object.keys(meta.tables.users!.relations), ['posts', 'comments']);
+    assert.deepEqual(Object.keys(meta.tables.posts!.relations), ['user', 'comments']);
+    assert.deepEqual(Object.keys(meta.tables.comments!.relations), ['post', 'user']);
+  });
+});

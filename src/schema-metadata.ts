@@ -410,7 +410,7 @@ export function schemaDefToMetadata(def: SchemaDef, options: { legacyToManyUniqu
   // disambiguation, collision resolution against scalar column fields, a
   // unique foreign key's to-one reverse relation, and the conservative
   // pure-junction manyToMany.
-  const relationsByTable = deriveRelations({
+  const facts = {
     tableNames: Object.values(def.tables).map((t) => t.name),
     foreignKeys: fkEntries,
     pkByTable,
@@ -420,7 +420,21 @@ export function schemaDefToMetadata(def: SchemaDef, options: { legacyToManyUniqu
     junctionKeysByTable,
     fkActions,
     ...(options.legacyToManyUniques ? { legacyToManyUniques: true } : {}),
-  });
+  };
+  const relationsByTable = deriveRelations(facts);
+
+  // The names above are the sorted derivation's, so they match introspection.
+  // The ORDER each table lists them in stays declaration order, as it was
+  // before the derivation was shared, so a schema whose relation names did not
+  // change keeps generating the same files. A second, silent derivation that
+  // takes the declarations as given supplies that order; a name it does not
+  // produce (one a contested name moved) follows in the sorted order.
+  const declared = deriveRelations({ ...facts, inCatalogOrder: true, logger: {} });
+  for (const [table, relations] of relationsByTable) {
+    const order = Object.keys(declared.get(table) ?? {}).filter((name) => Object.hasOwn(relations, name));
+    for (const name of Object.keys(relations)) if (!order.includes(name)) order.push(name);
+    relationsByTable.set(table, Object.fromEntries(order.map((name) => [name, relations[name]!])));
+  }
 
   // ----- Pass 5: assemble TableMetadata -----
   const tables: Record<string, TableMetadata> = {};

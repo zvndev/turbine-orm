@@ -28,8 +28,10 @@
   - When two foreign keys want one name, the first in source table and
     constraint name order keeps it, on every engine. Before, the order was
     whatever the catalog returned, and declaration order for `defineSchema`.
-    Generated files for these engines and for `defineSchema` can list
-    relations in a different order as a result.
+    Generated files for these engines can list relations in a different order
+    as a result. `defineSchema` takes its names from the same order and still
+    lists each table's relations in declaration order, so its generated files
+    change only where a relation's name or definition did.
   - Pin any relation name that moved with `relationNames`.
     [Details, and the edge cases that still differ](docs/relation-names.md#known-differences).
 
