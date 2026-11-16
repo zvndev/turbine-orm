@@ -114,13 +114,14 @@ with its own catalog facts, so the shapes that differed across engines in
    gives relations carrying `onDelete: 'cascade'` on every engine.
 3. **Two composite foreign keys from one table to the same target** are named
    from their constraint names. SQLite, libSQL and D1 read a declared
-   `CONSTRAINT` name from the `CREATE TABLE` text. A name the engine generated
-   (MySQL `returns_ibfk_1`, SQL Server `FK__returns__...` with a random
-   suffix), or no name at all, counts as the name PostgreSQL would have
-   generated. For two unnamed `returns (tenant_id, order_id)` and
-   `returns (tenant_id, replacement_id)` keys to `orders`, the first gives
-   `returns.returnsTenantIdOrderId` (from `returns_tenant_id_order_id_fkey`)
-   on every engine.
+   `CONSTRAINT` name from the `CREATE TABLE` text, matched to its key by the
+   child columns, the target table and the referenced columns. A name the
+   engine generated (MySQL `returns_ibfk_1`, SQL Server `FK__returns__...`
+   with a random suffix), or no name at all, counts as the name PostgreSQL
+   would have generated for the same declarations. For two unnamed
+   `returns (tenant_id, order_id)` and `returns (tenant_id, replacement_id)`
+   keys to `orders`, the first gives `returns.returnsTenantIdOrderId` (from
+   `returns_tenant_id_order_id_fkey`) on every engine.
 4. **Which relation keeps a contested name.** When two foreign keys want one
    name, the first in source table, then constraint name, order keeps it and
    the other falls back to another name, whatever order the catalog returned
@@ -129,21 +130,59 @@ with its own catalog facts, so the shapes that differed across engines in
    gives `notes.user` to the key to `user` and `notes.userRel` to the key to
    `users`. Pin either name with `relationNames`.
 
-These edge cases, all in how a composite foreign key's constraint name is
-read, can still give different names:
+### Generated constraint names follow declaration order
+
+PostgreSQL names an unnamed foreign key `<table>_<columns>_fkey`, cut to 63
+bytes, and counts up (`_fkey1`, `_fkey2`) while the name is taken. Every
+explicit name in the table is taken first. The names are facts in its catalog,
+and they depend on the order the keys are declared in:
+
+```sql
+CREATE TABLE parents (a INTEGER, b INTEGER, c INTEGER, d INTEGER, PRIMARY KEY (a, b), UNIQUE (c, d));
+CREATE TABLE links (
+  x INTEGER, y INTEGER,
+  FOREIGN KEY (x, y) REFERENCES parents (a, b),  -- links_x_y_fkey:  links.linksXY
+  FOREIGN KEY (x, y) REFERENCES parents (c, d)   -- links_x_y_fkey1: links.linksXYFkey1
+);
+```
+
+Declare the two keys the other way round and `links.linksXY` references
+`(c, d)` instead. The other engines synthesize these names by the same rule,
+in the order the `CREATE TABLE` statement declares the keys: SQLite's text,
+which SQLite's own catalog lists in reverse, and the order MySQL numbers its
+`_ibfk_<n>` names in. An explicit name equal to a default, such as
+`CONSTRAINT links_x_y_fkey` on a second key, keeps its name and pushes the
+unnamed key to the counter, as on PostgreSQL. A schema declared in different
+orders on different databases can therefore swap two such relation names;
+pin them with `relationNames`.
+
+### What still differs
+
+These edge cases, all in reading the constraint name of a composite foreign
+key that shares its target, can still give different names:
 
 - MySQL stores no flag for a generated name, so an explicit constraint named
-  like one (`returns_ibfk_1`) is read as PostgreSQL's default name too.
-- SQLite, libSQL and D1 match a declared name to its foreign key by the child
-  columns and the target table. Two declarations over the same columns to the
-  same table are ambiguous, and both take PostgreSQL's default name.
-- When two default names collide (two unnamed keys over the same columns, or
-  names that truncate to the same 63 bytes), the `fkey1` suffix goes to the
-  key the catalog lists second, and that order differs between engines. An
-  explicit name equal to the default another key would take is not reserved
-  first.
+  like one (`CONSTRAINT returns_ibfk_1 FOREIGN KEY (x, y)`) is read as
+  unnamed and takes PostgreSQL's default, `returns_x_y_fkey`: MySQL gives
+  `returns.returnsXY` where PostgreSQL gives `returns.returnsIbfk_1`. To keep
+  PostgreSQL's name, rename it:
+  `relationNames: { returns: { returnsXY: 'returnsIbfk_1' } }`.
 - MySQL keeps an unquoted mixed-case constraint name as written, where
   PostgreSQL folds it to lower case.
+- SQL Server records no declaration order for the keys it named itself, so
+  between those the counter goes by child columns, then referenced table and
+  columns.
+- When two tables' default names coincide (`box_items` with `item_id` and
+  `box` with `items_item_id` are both `box_items_item_id_fkey`), PostgreSQL
+  gives the counter to the table created second; the other engines give it in
+  table name order.
+- PostgreSQL keeps the name a key was created with through a later table
+  rename or the drop of another key; the other engines name the keys a table
+  has now.
+- SQLite, libSQL and D1 take a declared name from the statement text. A key
+  whose clause the reader cannot follow (SQLite also accepts table
+  constraints with no comma between them) takes the default name, as an
+  unnamed key does.
 
 `src/test/relation-derivation-parity.test.ts` creates each shape natively on
 every engine it can reach and holds it to PostgreSQL's relations.

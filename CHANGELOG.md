@@ -20,11 +20,19 @@
     fields to generated metadata and changes no query.
   - When two composite foreign keys from one table point at the same target,
     their names come from the constraint names. SQLite, libSQL and D1 now read
-    a declared `CONSTRAINT` name from the `CREATE TABLE` text. A name the
+    a declared `CONSTRAINT` name from the `CREATE TABLE` text, matched to its
+    key by child columns, target table and referenced columns. A name the
     engine generated (MySQL `returns_ibfk_1`, SQL Server `FK__returns__...`
     with a random suffix) or no name at all now counts as the name PostgreSQL
-    would have generated, `returns_tenant_id_order_id_fkey`. Such relations
-    are renamed, for example from `returnsIbfk_1` to `returnsTenantIdOrderId`.
+    would have generated for the same declarations,
+    `returns_tenant_id_order_id_fkey`: in declaration order, cut to 63 bytes,
+    counting up (`_fkey1`) while a name is taken, with every explicit name
+    taken first. Such relations are renamed, for example from `returnsIbfk_1`
+    to `returnsTenantIdOrderId`. As on PostgreSQL, declaring two such keys
+    the other way round swaps their names. On SQLite, two unnamed keys over
+    the same columns now take their names in declaration order (SQLite's
+    catalog lists them in reverse), which can also change the order their
+    relations are listed in.
   - When two foreign keys want one name, the first in source table and
     constraint name order keeps it, on every engine. Before, the order was
     whatever the catalog returned, and declaration order for `defineSchema`.
@@ -34,6 +42,15 @@
     change only where a relation's name or definition did.
   - Pin any relation name that moved with `relationNames`.
     [Details, and the edge cases that still differ](docs/relation-names.md#known-differences).
+
+### Fixed
+
+- **`schemaDefToMetadata` no longer gives one table's referential actions to
+  another.** Two tables whose default constraint names coincide,
+  `boxItems.itemId` with `onDelete: 'cascade'` and `box.itemsItemId` (both
+  `box_items_item_id_fkey`), lost the cascade on `box_items.item`. Actions
+  now travel with each foreign key on every engine, so two keys can share a
+  name without sharing an action.
 
 ### Bundle size
 
@@ -45,8 +62,8 @@
 
   | Entry | Size | Limit |
   |---|---|---|
-  | `turbine-orm` (whole barrel) | 154.17 kB | 156 kB |
-  | `turbine-orm/mssql` | 131.25 kB | 138 kB |
+  | `turbine-orm` (whole barrel) | 154.44 kB | 156 kB |
+  | `turbine-orm/mssql` | 131.35 kB | 138 kB |
 
 ## 0.94.0 (2026-11-15)
 
