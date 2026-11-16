@@ -96,16 +96,16 @@ describe('SQL Server catalog metadata fidelity', () => {
     assert.deepEqual(Object.keys(filtered.tables.parents!.relations), []);
   });
 
-  it('names system-named composite keys as PostgreSQL would, after every explicit name', async () => {
+  it('names system-named composite keys as PostgreSQL would, after every explicit name, whatever their suffixes', async () => {
     const XY = ['x', 'y'];
     const AB = ['a', 'b'];
     const CD = ['c', 'd'];
     const system = { IS_SYSTEM_NAMED: true };
     // `swap` exchanges the random suffixes between keys that differ only in
-    // what they reference.
+    // what they reference, or only in their actions.
     const read = async (swap: boolean) => {
       const f = catalogFixture();
-      const tables = ['cn_links', 'cn_returns', 'cn_checked'];
+      const tables = ['cn_links', 'cn_ties', 'cn_returns', 'cn_checked'];
       f.tables.push('cn_parents', ...tables);
       for (const name of ['a', 'b', 'c', 'd']) f.columns.push(catalogColumn('cn_parents', name));
       for (const table of tables) for (const name of ['tenant', 'x', 'y']) f.columns.push(catalogColumn(table, name));
@@ -131,6 +131,8 @@ describe('SQL Server catalog metadata fidelity', () => {
       const [first, second] = swap ? ['F00D', '0BAD'] : ['0BAD', 'F00D'];
       fk('cn_links', XY, CD, `FK__cn_links__x__${first}`, system);
       fk('cn_links', XY, AB, `FK__cn_links__x__${second}`, system);
+      fk('cn_ties', XY, AB, `FK__cn_ties__x__${first}`, { ...system, DELETE_RULE: 'CASCADE' });
+      fk('cn_ties', XY, AB, `FK__cn_ties__x__${second}`, { ...system, DELETE_RULE: 'NO_ACTION' });
       // A system-named key whose default an explicit foreign key already holds.
       fk('cn_returns', ['tenant', 'y'], AB, 'FK__cn_return__tenan__1234', { ...system, DELETE_RULE: 'CASCADE' });
       fk('cn_returns', ['tenant', 'x'], AB, 'cn_returns_tenant_y_fkey', {});
@@ -162,9 +164,11 @@ describe('SQL Server catalog metadata fidelity', () => {
       );
     };
     const original = await read(false);
+    assert.deepEqual(await read(true), original, 'exchanging generated suffixes changed the relations');
     assert.deepEqual(original, {
-      // SQL Server records no declaration order: by referenced columns.
+      // SQL Server records no declaration order: by referenced columns, then actions.
       cn_links: { cnLinksXY: [XY, AB, null], cnLinksXYFkey1: [XY, CD, null] },
+      cn_ties: { cnTiesXY: [XY, AB, 'cascade'], cnTiesXYFkey1: [XY, AB, null] },
       cn_returns: {
         cnReturnsTenantY: [['tenant', 'x'], AB, null],
         cnReturnsTenantYFkey1: [['tenant', 'y'], AB, 'cascade'],

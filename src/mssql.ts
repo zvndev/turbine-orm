@@ -2023,9 +2023,9 @@ export async function introspectMssqlWith(
   // name PostgreSQL would have given it, so that relation is named the same on
   // every database and on every engine; an explicit name is reserved first.
   // SQL Server records no declaration order, so system-named keys are named in
-  // the order of their columns and what they reference, never of the suffix. A
-  // default also avoids the table's explicit CHECK, PRIMARY KEY and UNIQUE
-  // constraint names, which PostgreSQL creates first.
+  // the order of their columns, what they reference and their actions, never
+  // of the suffix. A default also avoids the table's explicit CHECK, PRIMARY
+  // KEY and UNIQUE constraint names, which PostgreSQL creates first.
   const reserved = new Map<string, string[]>();
   for (const r of await exec(
     `SELECT OBJECT_NAME(k.parent_object_id) AS TABLE_NAME, k.name AS CONSTRAINT_NAME
@@ -2043,7 +2043,7 @@ export async function introspectMssqlWith(
   const constraintNames = new Set<string>();
   const foreignKeys: ForeignKeyEntry[] = [];
   const identity = ({ fk }: { fk: ForeignKeyEntry }) =>
-    JSON.stringify([fk.sourceColumns, fk.targetTable, fk.targetColumns]);
+    JSON.stringify([fk.sourceColumns, fk.targetTable, fk.targetColumns, fk.actions?.onDelete, fk.actions?.onUpdate]);
   for (const [table, entries] of [...fkByTable].sort(([a], [b]) => compareCatalogNames(a, b))) {
     const keys = [...entries.values()].sort(
       (a, b) => Number(a.systemNamed) - Number(b.systemNamed) || compareCatalogNames(identity(a), identity(b)),
