@@ -1,6 +1,6 @@
 /**
  * The unique foreign key to-one, beyond the shapes in
- * relation-unique-fk-parity.test.ts:
+ * relation-derivation-parity.test.ts:
  *
  * 1. `legacyToManyUniques: true` restores the earlier output (`users.profiles`,
  *    hasMany) on every entry point that derives relations, and `relationNames`

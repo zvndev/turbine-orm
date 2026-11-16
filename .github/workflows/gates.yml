@@ -225,8 +225,7 @@ jobs:
           npm install --prefix "$peer" --no-package-lock --no-audit --no-fund better-sqlite3@12.11.1
           TURBINE_REQUIRE_SQLITE_BINDING=1 TURBINE_SQLITE_BINDING_PEER="$peer/node_modules/better-sqlite3" \
             npx tsx --test src/test/cross-engine-correctness.test.ts src/test/nested-write-parent-scope.test.ts \
-            src/test/relation-unique-fk-parity.test.ts src/test/relation-unique-fk-options.test.ts \
-            src/test/relation-derivation-parity.test.ts
+            src/test/relation-unique-fk-options.test.ts src/test/relation-derivation-parity.test.ts
         env:
           TURBINE_REQUIRE_ENGINE: sqlite
 

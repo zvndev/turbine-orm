@@ -230,6 +230,26 @@ const CASES: Case[] = [
     },
   },
   {
+    name: 'two unique foreign keys from one table to the same target',
+    tables: [
+      t('people', [id(), text('name')]),
+      t(
+        'couples',
+        [id(), int('partner_a_id', { notNull: true, unique: true }), int('partner_b_id', { unique: true })],
+        {
+          foreignKeys: [fk('partner_a_id', 'people'), fk('partner_b_id', 'people')],
+        },
+      ),
+    ],
+    expected: {
+      people: {
+        coupleByPartnerA: hasOne('couples', 'partner_a_id'),
+        coupleByPartnerB: hasOne('couples', 'partner_b_id'),
+      },
+      couples: { partnerA: belongsTo('people', 'partner_a_id'), partnerB: belongsTo('people', 'partner_b_id') },
+    },
+  },
+  {
     name: 'self-relations, one of them unique',
     tables: [
       t('employees', [id(), int('manager_id'), int('mentor_id', { unique: true }), text('name')], {
@@ -243,6 +263,37 @@ const CASES: Case[] = [
         mentor: belongsTo('employees', 'mentor_id'),
         employeeByMentor: hasOne('employees', 'mentor_id'),
       },
+    },
+  },
+  {
+    // The singular `node` is the belongsTo's name, so the to-one falls back to
+    // the plural, on PostgreSQL and therefore everywhere.
+    name: 'self-relation over a unique foreign key',
+    tables: [
+      t('nodes', [id(), int('successor_id', { unique: true }), text('label')], {
+        foreignKeys: [fk('successor_id', 'nodes')],
+      }),
+    ],
+    expected: {
+      nodes: { node: belongsTo('nodes', 'successor_id'), nodes: hasOne('nodes', 'successor_id') },
+    },
+  },
+  {
+    // One unique column, two foreign keys to two parents: each is decided on
+    // its own, and both are to-one.
+    name: 'one unique column referencing two parents',
+    tables: [
+      USERS,
+      t('accounts', [id(), text('label')]),
+      t('profiles', [id(), int('owner_id', { notNull: true, unique: true })], {
+        foreignKeys: [fk('owner_id', 'users'), fk('owner_id', 'accounts')],
+      }),
+    ],
+    noCodeFirst: 'defineSchema `references` names one target per column',
+    expected: {
+      users: { profile: hasOne('profiles', 'owner_id') },
+      accounts: { profile: hasOne('profiles', 'owner_id') },
+      profiles: { user: belongsTo('users', 'owner_id'), account: belongsTo('accounts', 'owner_id') },
     },
   },
   {
@@ -437,6 +488,45 @@ const CASES: Case[] = [
         profile: hasMany('profile', 'owner_id'),
         profiles: hasOne('profiles', 'user_id'),
       },
+    },
+  },
+  {
+    // Two relations that want one name: the first foreign key in (source
+    // table, constraint name) order keeps it, whatever order the catalog
+    // returned them in (SQLite numbers the LAST declared key 0). Here
+    // `notes.user` is wanted by a key to `user` (its constraint name sorts
+    // first) and a key to `users`.
+    name: 'a contested name within one table',
+    tables: [
+      t('user', [id(), text('handle')]),
+      USERS,
+      t('notes', [id(), int('owner'), int('user_id')], {
+        foreignKeys: [
+          fk('owner', 'user', 'id', { name: 'notes_a_owner' }),
+          fk('user_id', 'users', 'id', { name: 'notes_z_user' }),
+        ],
+      }),
+    ],
+    expected: {
+      user: { notes: hasMany('notes', 'owner') },
+      users: { notes: hasMany('notes', 'user_id') },
+      notes: { user: belongsTo('user', 'owner'), userRel: belongsTo('users', 'user_id') },
+    },
+  },
+  {
+    // The same race across two tables. MySQL's catalog orders by constraint
+    // name alone, so `a_users_post` (on `users`) came before `z_post_owner`
+    // (on `post`); the source table decides first. Both want `users.post`.
+    name: 'a contested name across tables',
+    tables: [
+      t('posts', [id(), text('title')]),
+      t('users', [id(), int('post_id')], { foreignKeys: [fk('post_id', 'posts', 'id', { name: 'a_users_post' })] }),
+      t('post', [id(), int('owner_id')], { foreignKeys: [fk('owner_id', 'users', 'id', { name: 'z_post_owner' })] }),
+    ],
+    expected: {
+      posts: { users: hasMany('users', 'post_id') },
+      users: { postRel: belongsTo('posts', 'post_id'), post: hasMany('post', 'owner_id') },
+      post: { user: belongsTo('users', 'owner_id') },
     },
   },
   {

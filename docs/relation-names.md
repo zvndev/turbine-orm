@@ -145,6 +145,5 @@ read, can still give different names:
 - MySQL keeps an unquoted mixed-case constraint name as written, where
   PostgreSQL folds it to lower case.
 
-`src/test/relation-derivation-parity.test.ts` and
-`src/test/relation-unique-fk-parity.test.ts` create each shape natively on
-every engine they can reach and hold it to PostgreSQL's relations.
+`src/test/relation-derivation-parity.test.ts` creates each shape natively on
+every engine it can reach and holds it to PostgreSQL's relations.
