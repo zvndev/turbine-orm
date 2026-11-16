@@ -35,6 +35,19 @@
   - Pin any relation name that moved with `relationNames`.
     [Details, and the edge cases that still differ](docs/relation-names.md#known-differences).
 
+### Bundle size
+
+- **Two limits rise.** The main barrel goes from 154 to 156 kB brotli, and
+  `turbine-orm/mssql` from 131 to 138 kB. The shared relation derivation is in
+  both graphs, and SQL Server's introspector now feeds it the catalog facts it
+  needs. No driver code was added. Measured with `npm run size` (brotli,
+  drivers external):
+
+  | Entry | Size | Limit |
+  |---|---|---|
+  | `turbine-orm` (whole barrel) | 154.17 kB | 156 kB |
+  | `turbine-orm/mssql` | 131.25 kB | 138 kB |
+
 ## 0.94.0 (2026-11-15)
 
 Five new engines and transports, a CLI project lifecycle for SQLite, MySQL,

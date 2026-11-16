@@ -447,7 +447,16 @@ export default [
     // Shared pull cleanup and generator templates were consolidated first.
     // Deliberately revise the main README claim to 150 kB for this added API;
     // retain the 117 kB edge claim and every other existing budget.
-    limit: '154 kB',
+    limit: '156 kB',
+    // RAISED 2026-11-15, 154 -> 156 kB, a recorded decision, with the README
+    // claim. One relation derivation for every engine and `defineSchema`
+    // (catalog-metadata.ts `deriveRelations`), measured with `npm run build`
+    // then `npx size-limit` against 153839 B before it: main 154170 B (+331).
+    // That is the shared derivation and its code-point name comparator (+251)
+    // and `defineSchema` keeping its relations in declaration order (+80).
+    // Two trims, a shorter constraint-name function and a plain string
+    // comparator, each made one of the two failing entries larger in brotli
+    // and were reverted. 156 and not 155: the measured-round-up plus 1 kB policy.
     // RAISED 2026-11-14, 152 -> 154 kB, a recorded decision, with the README
     // claim. Release 0.94.0's correctness and read-path work, measured with
     // `npm run build` then `npx size-limit` against 150611 B before it:
@@ -568,7 +577,13 @@ export default [
     // every entry carrying the client graph. The shared scalar compiler and
     // projection-plan reuse remove fixed costs from small reads, about 240 B.
     // No SQL Server driver code was added. The 0.94.0 size table moves with it.
-    limit: '131 kB',
+    // RAISED 2026-11-15, 131 -> 138 kB, a recorded decision. The SQL Server
+    // introspector now hands its catalog facts to the one relation derivation
+    // every engine shares, and names a constraint SQL Server generated as
+    // PostgreSQL would: measured 130632 -> 131248 B (+616). This entry is not a
+    // published claim, so it takes the 5% engine headroom the sqlite and mysql
+    // entries already have instead of another 1 kB step.
+    limit: '138 kB',
     // mssql is an optional peer loaded via a dynamic import in the factory, so it
     // is never in the static graph, exclude it (and pg) from the footprint.
     ignore: [...PG, 'mssql'],
