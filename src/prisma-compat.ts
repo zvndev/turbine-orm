@@ -94,10 +94,11 @@
  * - **Write projections**: `select` / `omit` on create/update/delete/upsert
  *   narrow the RETURNED OBJECT (see {@link resolveWriteProjection}); they do
  *   NOT narrow the statement's `RETURNING` list, so the column still crosses
- *   the wire, and `pii: true` remains the SQL-level control. A relation key in
- *   either (or any `include` on a write) THROWS, since a write returns its own
- *   row only. `omit` on READS is translated to core's own `omit`, see
- *   {@link translateOmit}.
+ *   the wire, and `pii: true` remains the SQL-level control. A write whose
+ *   `include` / `select` names a relation or `_count` runs as the write followed
+ *   by a read of the written row by primary key, in one transaction (a delete
+ *   reads first), so it returns what Prisma returns. `omit` on READS is
+ *   translated to core's own `omit`, see {@link translateOmit}.
  * - **`take` / `skip` / `cursor` on `count` and `aggregate`** throw: Prisma
  *   computes those over one page of rows and Turbine has no paged count. An
  *   `orderBy` alone changes nothing there and is accepted. `count({ select })`
@@ -1474,9 +1475,9 @@ function assertWriteProjectionField(ctx: Ctx, mm: PrismaModelMap, op: string, cl
  * SQL-level control is `pii: true` on the column, which is enforced in core and
  * is unaffected by any of this.
  *
- * A relation (or `_count`) key THROWS instead: a write returns its own row and
- * nothing else, so serving it is impossible, and the alternative is handing
- * back a row whose relation property is silently `undefined`, which would hide an unsupported projection.
+ * A projection naming a relation (or `_count`) never reaches this function: the
+ * delegate runs that write as the write plus a read-back (see
+ * `projectsRelations` in makeDelegate). The refusals below are the backstop.
  */
 function resolveWriteProjection(
   ctx: Ctx,
@@ -2886,6 +2887,73 @@ function makeDelegate(
     );
   };
 
+  /**
+   * A write whose `include` / `select` names a relation or `_count`. A write
+   * statement returns its own row only, so these run as Prisma's semantics
+   * describe them: the write, then a read of the written row by primary key with
+   * the caller's projection, in ONE transaction (a delete reads first, since
+   * afterwards there is nothing to read). The read is an ordinary compat read,
+   * so nested and filtered counts work there too.
+   */
+  const projectsRelations = (a: Args | undefined): boolean => {
+    if (!a) return false;
+    const include = a.include;
+    if (isPlainRecord(include) && Object.values(include).some((v) => v !== false && v != null)) return true;
+    const select = a.select;
+    if (!isPlainRecord(select)) return false;
+    return Object.entries(select).some(
+      ([key, v]) => v !== false && v != null && (key === '_count' || ownLookup(mm.relations, key) !== undefined),
+    );
+  };
+  const projectionOf = (a: Args): Args => {
+    const out: Args = {};
+    if (a.select !== undefined) out.select = a.select;
+    if (a.include !== undefined) out.include = a.include;
+    if (a.omit !== undefined) out.omit = a.omit;
+    return out;
+  };
+  /** Validate the projection before anything is written (its errors would otherwise follow the write). */
+  const checkReadProjection = (a: Args): void => {
+    translateProjection(ctx, mm, projectionOf(a), 0, newReadPlan(mm, true));
+  };
+  /** The Prisma `where` naming one written row by primary key, from core's raw row. */
+  const primaryKeyWhere = (op: string, raw: unknown): Args => {
+    const fields = primaryKeyFields(ctx, mm);
+    if (fields.length === 0 || !isPlainRecord(raw)) {
+      throw new UnsupportedFeatureError(
+        `include / a relation select on ${op} of model "${modelName(ctx, mm)}"`,
+        'prisma-compat',
+        'The written row is read back by primary key and this model has none. Read the relation with a ' +
+          'separate findUnique inside the same $transaction.',
+      );
+    }
+    const where: Args = {};
+    for (const field of fields) setOwn(where, prismaFieldName(ctx, mm, field), raw[field]);
+    return where;
+  };
+  const readWritten = async (table: (name: string) => CompatQueryInterface, where: Args, a: Args) => {
+    const plan = newReadPlan(mm, true);
+    const t = translateReadArgs(ctx, mm, { where, ...projectionOf(a) }, 'unique', plan);
+    const raw = await table(mm.table).findUnique(t);
+    if (planHasCounts(plan)) await attachPlannedCounts(table, raw, plan, {});
+    const shaped = reshapeRowOrNull(ctx, mm, raw);
+    return planHasTrim(plan) ? trimPlannedRows(ctx, shaped, plan) : shaped;
+  };
+  const writeThenRead = (
+    op: string,
+    a: Args,
+    write: (qi: CompatQueryInterface) => Promise<unknown>,
+  ): ((table: (name: string) => CompatQueryInterface) => Promise<unknown>) => {
+    if (op === 'delete') {
+      return async (table) => {
+        const before = await readWritten(table, a.where as Args, a);
+        await write(table(mm.table));
+        return before;
+      };
+    }
+    return async (table) => readWritten(table, primaryKeyWhere(op, await write(table(mm.table))), a);
+  };
+
   const requireWhere = (args: Args | undefined, op: string): Args => {
     if (!args || args.where === undefined) {
       throw new ValidationError(`prisma-compat: ${op} on "${modelName(ctx, mm)}" requires a \`where\`.`);
@@ -2944,23 +3012,28 @@ function makeDelegate(
       // write runs and stays deferred), read back by every result path.
       let proj: WriteProjection = NO_WRITE_PROJECTION;
       const shape = (raw: unknown) => applyWriteProjection(proj, reshapeRow(ctx, mm, raw));
+      const a = (args ?? {}) as Args;
+      const relational = projectsRelations(a);
+      const projected = (t: Args) => writeThenRead('create', a, (qi) => qi.create(t));
       return defer(
         'create',
         args,
         () => {
-          proj = resolveWriteProjection(ctx, mm, 'create', args as Args);
+          if (relational) checkReadProjection(a);
+          else proj = resolveWriteProjection(ctx, mm, 'create', a);
           const t: Args = {
-            data: translateWriteData(ctx, mm, applyCreateDefaults(mm, (args as Args).data)),
+            data: translateWriteData(ctx, mm, applyCreateDefaults(mm, a.data)),
             ...coreWriteProjection(mm, proj),
           };
-          applyNativeOptions(CREATE_OPTIONS, args as Args, t);
+          applyNativeOptions(CREATE_OPTIONS, a, t);
           return t;
         },
-        (qi, t) => qi.create(t).then(shape),
+        (qi, t) => (relational ? runInTx(projected(t)) : qi.create(t).then(shape)),
         {
           build: (qi, t) => qi.buildCreate(t),
           reshape: shape,
-          nested: (t) => hasNestedKeys(ctx, mm, t.data),
+          nested: (t) => relational || hasNestedKeys(ctx, mm, t.data),
+          execInTx: (table, t) => (relational ? projected(t)(table) : table(mm.table).create(t).then(shape)),
         },
       ) as unknown as Promise<PrismaModelTypes['Row']>;
     },
@@ -3009,12 +3082,15 @@ function makeDelegate(
     update: (args) => {
       let proj: WriteProjection = NO_WRITE_PROJECTION;
       const shape = (raw: unknown) => applyWriteProjection(proj, reshapeRow(ctx, mm, raw));
+      const relational = projectsRelations(args as Args | undefined);
+      const projected = (t: Args) => writeThenRead('update', args as Args, (qi) => qi.update(t));
       return defer(
         'update',
         args,
         () => {
           const a = requireWhere(args, 'update');
-          proj = resolveWriteProjection(ctx, mm, 'update', a);
+          if (relational) checkReadProjection(a);
+          else proj = resolveWriteProjection(ctx, mm, 'update', a);
           const t: Args = {
             where: translateWhere(ctx, mm, a.where),
             data: translateWriteData(ctx, mm, applyUpdateTouch(mm, a.data)),
@@ -3032,11 +3108,12 @@ function makeDelegate(
           }
           return t;
         },
-        (qi, t) => qi.update(t).then(shape),
+        (qi, t) => (relational ? runInTx(projected(t)) : qi.update(t).then(shape)),
         {
           build: (qi, t) => qi.buildUpdate(t),
           reshape: shape,
-          nested: (t) => hasNestedKeys(ctx, mm, t.data),
+          nested: (t) => relational || hasNestedKeys(ctx, mm, t.data),
+          execInTx: (table, t) => (relational ? projected(t)(table) : table(mm.table).update(t).then(shape)),
         },
       ) as unknown as Promise<PrismaModelTypes['Row']>;
     },
@@ -3064,18 +3141,26 @@ function makeDelegate(
     delete: (args) => {
       let proj: WriteProjection = NO_WRITE_PROJECTION;
       const shape = (raw: unknown) => applyWriteProjection(proj, reshapeRow(ctx, mm, raw));
+      const relational = projectsRelations(args as Args | undefined);
+      const projected = (t: Args) => writeThenRead('delete', args as Args, (qi) => qi.delete(t));
       return defer(
         'delete',
         args,
         () => {
           const a = requireWhere(args, 'delete');
-          proj = resolveWriteProjection(ctx, mm, 'delete', a);
+          if (relational) checkReadProjection(a);
+          else proj = resolveWriteProjection(ctx, mm, 'delete', a);
           const t: Args = { where: translateWhere(ctx, mm, a.where), ...coreWriteProjection(mm, proj) };
           applyNativeOptions(DELETE_OPTIONS, a, t);
           return t;
         },
-        (qi, t) => qi.delete(t).then(shape),
-        { build: (qi, t) => qi.buildDelete(t), reshape: shape },
+        (qi, t) => (relational ? runInTx(projected(t)) : qi.delete(t).then(shape)),
+        {
+          build: (qi, t) => qi.buildDelete(t),
+          reshape: shape,
+          nested: () => relational,
+          execInTx: (table, t) => (relational ? projected(t)(table) : table(mm.table).delete(t).then(shape)),
+        },
       ) as unknown as Promise<PrismaModelTypes['Row']>;
     },
     deleteMany: (args = {}) =>
@@ -3097,12 +3182,15 @@ function makeDelegate(
     upsert: (args) => {
       let proj: WriteProjection = NO_WRITE_PROJECTION;
       const shape = (raw: unknown) => applyWriteProjection(proj, reshapeRow(ctx, mm, raw));
+      const relational = projectsRelations(args as Args | undefined);
+      const projected = (t: Args) => writeThenRead('upsert', args as Args, (qi) => qi.upsert(t));
       return defer(
         'upsert',
         args,
         () => {
           const a = requireWhere(args, 'upsert');
-          proj = resolveWriteProjection(ctx, mm, 'upsert', a);
+          if (relational) checkReadProjection(a);
+          else proj = resolveWriteProjection(ctx, mm, 'upsert', a);
           const t: Args = {
             where: translateWhere(ctx, mm, a.where),
             create: translateWriteData(ctx, mm, applyCreateDefaults(mm, a.create)),
@@ -3115,14 +3203,14 @@ function makeDelegate(
         // Core `upsert` has Prisma's semantics itself (it looks the row up by
         // `where` whenever one conflict statement would mean something else,
         // and runs nested writes), so the adapter passes it straight through.
-        (qi, t) => qi.upsert(t).then(shape),
+        (qi, t) => (relational ? runInTx(projected(t)) : qi.upsert(t).then(shape)),
         {
           build: (qi, t) => qi.buildUpsert(t),
           reshape: shape,
           // Batchable only when core would run it as one statement. PowDB has
           // no deferred statements at all, so it always takes the tx path.
-          nested: (t, qi) => qi.upsertNeedsLookup?.(t) ?? true,
-          execInTx: async (table, t) => shape(await table(mm.table).upsert(t)),
+          nested: (t, qi) => relational || (qi.upsertNeedsLookup?.(t) ?? true),
+          execInTx: async (table, t) => (relational ? projected(t)(table) : shape(await table(mm.table).upsert(t))),
         },
       ) as unknown as Promise<PrismaModelTypes['Row']>;
     },

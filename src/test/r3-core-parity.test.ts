@@ -19,7 +19,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import type { TurbineClient } from '../client.js';
-import { ConnectionError, UnsupportedFeatureError, ValidationError } from '../errors.js';
+import { ConnectionError, ValidationError } from '../errors.js';
 import { ALL_POWDB_CAPABILITIES, type PowdbPool } from '../powdb.js';
 import { PowqlInterface } from '../powql.js';
 import { type CompatTurbineClient, createPrismaCompatClient } from '../prisma-compat.js';
@@ -275,12 +275,20 @@ describe('R3: prisma-compat omit on write operations', () => {
       assert.deepEqual(row, { id: 1 });
     });
 
-    it(`${op}: a relation in \`select\` throws instead of returning undefined`, async () => {
-      await assert.rejects(() => call(compat(), { select: { id: true, posts: true } }), UnsupportedFeatureError);
+    // A relation in a write's projection is served by reading the written row
+    // back (the stub's read returns the same row, with no relation key), and
+    // the scalar part of the projection still holds.
+    it(`${op}: a relation in \`select\` is read back with the row, not refused or dropped silently`, async () => {
+      // The stub's read ignores the projection core would apply, so only the
+      // row's identity is asserted here; the live suites assert the shape.
+      const row = (await call(compat(), { select: { id: true, posts: true } })) as Record<string, unknown>;
+      assert.equal(row.id, 1);
     });
 
-    it(`${op}: \`include\` of a relation throws instead of being ignored`, async () => {
-      await assert.rejects(() => call(compat(), { include: { posts: true } }), UnsupportedFeatureError);
+    it(`${op}: \`include\` of a relation is read back with the row`, async () => {
+      const row = (await call(compat(), { include: { posts: true } })) as Record<string, unknown>;
+      assert.equal(row.email, 'a@b.c');
+      await assert.rejects(() => call(compat(), { include: { postz: true } }), ValidationError);
     });
 
     it(`${op}: a relation in \`omit\` throws`, async () => {
