@@ -483,7 +483,9 @@ describe('nested-write: belongsTo upsert', () => {
         ),
       (err: Error) => {
         assert.ok(err instanceof ValidationError);
-        assert.ok(err.message.includes('requires "where", "create", and "update"'));
+        // `where` is optional on a to-one upsert (the row the record points at);
+        // `create` and `update` are not.
+        assert.ok(err.message.includes('requires "create" and "update"'), err.message);
         return true;
       },
     );

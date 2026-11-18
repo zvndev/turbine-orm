@@ -518,7 +518,11 @@ export default [
     // pagination dialect-hook dispatch). These are tiny and engine-neutral, but
     // the edge bundle includes the query builder, so the budget gets a small bump.
     path: 'dist/serverless.js',
-    limit: '120 kB',
+    limit: '121 kB',
+    // RAISED 2026-11-18, 120 -> 121 kB, with the claim (README.md and the
+    // serverless / batadb / neon docs pages). Prisma-compat parity (shared
+    // client graph: nested-write defaults, URL
+    // schema/pool parameters, ordered transaction statements): 119552 -> 120818 B (+1266).
     // RAISED 2026-11-14, 118 -> 119 kB, a recorded decision, with the claim
     // (README.md and the serverless / batadb / neon docs pages). On top of
     // the transaction outcome work above (now +492 with its later fixes):
@@ -551,7 +555,8 @@ export default [
     // The native peer's installed bytes are measured separately, not counted as zero.
     name: 'optional better-sqlite3 entry (peer excluded; installed native bytes measured separately)',
     path: 'dist/better-sqlite3.js',
-    limit: '135 kB',
+    limit: '136 kB',
+    // Prisma-compat parity, same shared graph: 134153 -> 135212 B (+1059).
     ignore: [...PG, 'better-sqlite3'],
     modifyEsbuildConfig: nodePlatform,
   },
@@ -598,7 +603,8 @@ export default [
     // The largest entry: it carries the whole client/query graph AND powql.ts,
     // a second, parallel query generator for a non-SQL language.
     path: 'dist/powdb.js',
-    limit: '150 kB',
+    limit: '151 kB',
+    // Prisma-compat parity, same shared graph: 149211 -> 150234 B (+1023).
     // Both PowDB drivers are optional peers behind dynamic imports (the
     // networked client and the embedded napi addon), so neither is in the
     // static graph.
@@ -635,7 +641,10 @@ export default [
     // graph is NOT bundled with it. If this number jumps toward the other
     // entries, something started importing core values instead of core types.
     path: 'dist/prisma-compat.js',
-    limit: '20 kB',
+    limit: '21 kB',
+    // Parity gaps closed in the shim itself (nested and filtered _count, include on
+    // writes, fragment composition, turbineOf/bindTransaction): 18183 -> 20606 B (+2423).
+    // Still type-only imports from core.
     ignore: PG,
     modifyEsbuildConfig: nodePlatform,
   },

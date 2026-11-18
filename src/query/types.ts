@@ -1865,8 +1865,9 @@ export interface UpsertArgs<
 // Nested write operation types
 //
 // These mirror exactly what the runtime nested-write engine
-// (src/nested-write.ts) supports: create / connect / connectOrCreate in a
-// create() context, plus disconnect / set / delete / update / upsert in an
+// (src/nested-write.ts) supports: create / createMany / connect /
+// connectOrCreate in a create() context, plus disconnect / set / delete /
+// update / upsert in an
 // update() context. They are wired into `CreateArgs.data` / `UpdateArgs.data`
 // via {@link CreateDataInput} / {@link UpdateDataInput}, keyed by the
 // generated `*Relations` map (the same `RelationDescriptor` phantom brand
@@ -1885,10 +1886,21 @@ export interface ConnectOrCreateOp<T, TR extends object = {}> {
   create: CreateDataInput<T, TR>;
 }
 
+/**
+ * Nested `createMany` op (one-to-many relations): rows inserted in one batch,
+ * each without nested relation writes of its own, optionally skipping rows that
+ * collide with a unique key.
+ */
+export interface NestedCreateManyOp<T> {
+  data: OptionalInput<T> | OptionalInput<T>[];
+  skipDuplicates?: boolean | undefined;
+}
+
 /** Nested write ops valid inside `create()` data for a relation field. */
 // biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations", matches RelationDescriptor default
 export interface NestedCreateOp<T, TR extends object = {}> {
   create?: CreateDataInput<T, TR> | CreateDataInput<T, TR>[] | undefined;
+  createMany?: NestedCreateManyOp<T> | undefined;
   connect?: Partial<T> | Partial<T>[] | undefined;
   connectOrCreate?: ConnectOrCreateOp<T, TR> | ConnectOrCreateOp<T, TR>[] | undefined;
 }
@@ -1932,13 +1944,15 @@ export interface NestedToOneUpdateOp<T, TR extends object = {}> extends NestedTo
   delete?: boolean | Partial<T> | undefined;
   /** Update the row this record points at. */
   update?: { data: UpdateDataInput<T, TR> } | undefined;
-  upsert?: NestedUpsertOpItem<T, TR> | undefined;
+  /** `where` is optional: without it the row is the one this record points at. */
+  upsert?: (Omit<NestedUpsertOpItem<T, TR>, 'where'> & { where?: Partial<T> | undefined }) | undefined;
 }
 
 /** Nested write ops valid inside `update()` data for a relation field. */
 // biome-ignore lint/complexity/noBannedTypes: {} means "target has no relations", matches RelationDescriptor default
 export interface NestedUpdateOp<T, TR extends object = {}> {
   create?: CreateDataInput<T, TR> | CreateDataInput<T, TR>[] | undefined;
+  createMany?: NestedCreateManyOp<T> | undefined;
   connect?: Partial<T> | Partial<T>[] | undefined;
   connectOrCreate?: ConnectOrCreateOp<T, TR> | ConnectOrCreateOp<T, TR>[] | undefined;
   disconnect?: Partial<T> | Partial<T>[] | undefined;

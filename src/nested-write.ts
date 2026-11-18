@@ -30,7 +30,7 @@ import { normalizeKeyColumns } from './schema.js';
 
 const MAX_DEPTH = 10;
 
-const CREATE_ONLY_OPS = new Set(['create', 'connect', 'connectOrCreate']);
+const CREATE_ONLY_OPS = new Set(['create', 'createMany', 'connect', 'connectOrCreate']);
 const UPDATE_ONLY_OPS = new Set(['disconnect', 'set', 'delete', 'update', 'upsert']);
 
 // ---------------------------------------------------------------------------
@@ -227,6 +227,7 @@ function isRelationEntry(meta: TableMetadata, key: string, value: unknown): bool
  */
 const PAYLOAD_ROWS: readonly (readonly [string, readonly string[] | null])[] = [
   ['create', null],
+  ['createMany', ['data']],
   ['connectOrCreate', ['create']],
   ['update', ['data']],
   ['updateMany', ['data']],
@@ -399,10 +400,16 @@ function validateOps(relationName: string, ops: Record<string, unknown>, isUpdat
         : ', disconnect, set, delete, update, upsert';
       throw new ValidationError(
         `Unknown nested write operation "${opName}" on relation "${relationName}". ` +
-          `Valid operations: create, connect, connectOrCreate${isUpdate ? updateOps : ''}.`,
+          `Valid operations: create, createMany, connect, connectOrCreate${isUpdate ? updateOps : ''}.`,
       );
     }
     if (absent) continue;
+    if (opName === 'createMany' && rel && rel.type !== 'hasMany') {
+      throw new ValidationError(
+        `Nested createMany on "${relationName}" is only valid on a one-to-many relation; "${relationName}" is ` +
+          `${rel.type}. Use create instead.`,
+      );
+    }
     if (!isUpdate && UPDATE_ONLY_OPS.has(opName)) {
       throw new ValidationError(
         `Operation "${opName}" on relation "${relationName}" is only valid inside update(), not create().`,
@@ -448,7 +455,7 @@ function singleToOneItem<T>(value: T | T[], op: string, relName: string, rel: Re
  * that finds its row writes none; the levels requested for its `create` then
  * return that existing row's related rows, as any relation read does.
  */
-const READ_BACK_OPS: ReadonlySet<string> = new Set(['create', 'connectOrCreate', 'update', 'upsert']);
+const READ_BACK_OPS: ReadonlySet<string> = new Set(['create', 'createMany', 'connectOrCreate', 'update', 'upsert']);
 
 /**
  * The `with` clause that reads back the tree a nested write just wrote.
@@ -1513,6 +1520,18 @@ async function processHasManyCreate(
     }
   }
 
+  // createMany: `{ data: row | row[], skipDuplicates? }`, rows without nested
+  // relation writes (as in Prisma), inserted in the caller's order.
+  if (ops.createMany !== undefined) {
+    const { rows, skipDuplicates } = nestedCreateManyRows(ops.createMany, relName, ctx.schema.tables[rel.to]);
+    if (rows.length > 0) {
+      const injected = rows.map((row) => injectForeignKey(row, rel, parentRow, ctx.schema));
+      for (const run of createManyShapeRuns(injected)) {
+        await ctx.tx.table(rel.to).createMany({ data: run, ...(skipDuplicates ? { skipDuplicates: true } : {}) });
+      }
+    }
+  }
+
   // connect
   if (ops.connect !== undefined) {
     const items = toArray(ops.connect as Record<string, unknown> | Record<string, unknown>[]);
@@ -1922,6 +1941,49 @@ async function processSet(
   }
 }
 
+/**
+ * The rows of a nested `createMany` payload. Prisma's shape is
+ * `{ data: row | row[], skipDuplicates?: boolean }`, and its rows may not carry
+ * nested relation writes of their own (a `createMany` is one INSERT). Anything
+ * else is refused rather than read as zero rows.
+ */
+function nestedCreateManyRows(
+  payload: unknown,
+  relName: string,
+  childMeta: TableMetadata | undefined,
+): { rows: Record<string, unknown>[]; skipDuplicates: boolean } {
+  if (!isPlainRecord(payload)) {
+    throw new ValidationError(`Nested createMany on "${relName}" takes { data: [...], skipDuplicates?: boolean }.`);
+  }
+  for (const key of Object.keys(payload)) {
+    if (key !== 'data' && key !== 'skipDuplicates' && payload[key] !== undefined) {
+      throw new ValidationError(
+        `Nested createMany on "${relName}": unknown key "${key}". Valid keys: data, skipDuplicates.`,
+      );
+    }
+  }
+  const data = payload.data;
+  const rows = Array.isArray(data) ? data : isPlainRecord(data) ? [data] : undefined;
+  if (!rows || rows.some((row) => !isPlainRecord(row))) {
+    throw new ValidationError(`Nested createMany on "${relName}" requires \`data\`, a row object or an array of them.`);
+  }
+  if (payload.skipDuplicates !== undefined && typeof payload.skipDuplicates !== 'boolean') {
+    throw new ValidationError(`Nested createMany on "${relName}": skipDuplicates must be a boolean.`);
+  }
+  if (childMeta) {
+    for (const row of rows as Record<string, unknown>[]) {
+      const nested = Object.keys(extractRelationFields(row, childMeta).relations);
+      if (nested.length > 0) {
+        throw new ValidationError(
+          `Nested createMany on "${relName}" cannot write relations of its rows (${nested.join(', ')}). ` +
+            'Use create for rows with nested writes.',
+        );
+      }
+    }
+  }
+  return { rows: rows as Record<string, unknown>[], skipDuplicates: payload.skipDuplicates === true };
+}
+
 // ---------------------------------------------------------------------------
 // update / upsert operations (update-context only)
 // ---------------------------------------------------------------------------
@@ -1942,15 +2004,21 @@ async function processNestedUpdate(
 
   const correlation = parentCorrelationWhere(ctx, rel, parentRow);
   for (const item of items) {
-    if (!item.where || !item.data) {
-      throw new ValidationError(`Nested update on "${rel.name}" requires both "where" and "data" fields.`);
+    // A to-one update may leave out `where`: the row is the one pointing at
+    // this parent, as in Prisma.
+    const toOne = rel.type === 'hasOne';
+    if ((!item.where && !toOne) || !item.data) {
+      throw new ValidationError(
+        `Nested update on "${rel.name}" requires ${toOne ? 'a "data" field' : 'both "where" and "data" fields'}.`,
+      );
     }
-    assertTargetSelectsSomething(item.where, 'update', relName, rel);
-    if (!correlation) throw notRelatedToParent('update', relName, rel, item.where);
+    const target: Record<string, unknown> | true = item.where ?? true;
+    assertTargetSelectsSomething(target, 'update', relName, rel);
+    if (!correlation) throw notRelatedToParent('update', relName, rel, target);
     try {
-      await ctx.tx.table(rel.to).update({ where: scopeWhereToParent(item.where, correlation), data: item.data });
+      await ctx.tx.table(rel.to).update({ where: scopeWhereToParent(target, correlation), data: item.data });
     } catch (err) {
-      rethrowAsNotRelated(err, 'update', relName, rel, item.where);
+      rethrowAsNotRelated(err, 'update', relName, rel, target);
     }
   }
 }
@@ -1975,18 +2043,25 @@ async function processNestedUpsert(
   // surfaced to the caller rather than silently rewriting a stranger's row).
   const correlation = parentCorrelationWhere(ctx, rel, parentRow);
   for (const item of items) {
-    if (!item.where || !item.create || !item.update) {
-      throw new ValidationError(`Nested upsert on "${rel.name}" requires "where", "create", and "update" fields.`);
+    // A to-one upsert may leave out `where`, as in Prisma: the row it means is
+    // the one pointing at this parent (`true`, the to-one "the related row"
+    // selector). A to-many one must name its row.
+    const toOne = rel.type === 'hasOne';
+    if ((!item.where && !toOne) || !item.create || !item.update) {
+      throw new ValidationError(
+        `Nested upsert on "${rel.name}" requires ${toOne ? '' : '"where", '}"create", and "update" fields.`,
+      );
     }
-    assertTargetSelectsSomething(item.where, 'upsert', relName, rel);
+    const target: Record<string, unknown> | true = item.where ?? true;
+    assertTargetSelectsSomething(target, 'upsert', relName, rel);
     const update = upsertUpdateData(ctx, rel, item);
-    const scoped = correlation ? scopeWhereToParent(item.where, correlation) : null;
+    const scoped = correlation ? scopeWhereToParent(target, correlation) : null;
     const existing = scoped ? await ctx.tx.table(rel.to).findUnique({ where: scoped }) : null;
     if (existing && scoped) {
       try {
         await ctx.tx.table(rel.to).update({ where: scoped, data: update });
       } catch (err) {
-        rethrowAsNotRelated(err, 'upsert', relName, rel, item.where);
+        rethrowAsNotRelated(err, 'upsert', relName, rel, target);
       }
     } else {
       const injected = injectForeignKey(item.create, rel, parentRow, ctx.schema);
@@ -2054,15 +2129,16 @@ async function processBelongsToUpsert(
   parentTable: string,
 ): Promise<void> {
   const item = upsertArg as {
-    where: Record<string, unknown>;
+    where?: Record<string, unknown>;
     create: Record<string, unknown>;
     update: Record<string, unknown>;
   };
-  if (!item.where || !item.create || !item.update) {
-    throw new ValidationError(
-      `Nested upsert on belongsTo "${rel.name}" requires "where", "create", and "update" fields.`,
-    );
+  // `where` is optional, as in Prisma: without it the row is the one this
+  // parent points at.
+  if (!item.create || !item.update) {
+    throw new ValidationError(`Nested upsert on belongsTo "${rel.name}" requires "create" and "update" fields.`);
   }
+  const target: Record<string, unknown> | true = item.where ?? true;
 
   // Scope the lookup to the row this parent actually points at. Without the
   // correlation, a `where` naming any other row would update a record with no
@@ -2080,7 +2156,7 @@ async function processBelongsToUpsert(
   const existing = correlation
     ? (((
         await ctx.tx.table(rel.to).findMany({
-          where: scopeWhereToParent(item.where, correlation),
+          where: scopeWhereToParent(target, correlation),
           // Internal engine read (see the connect path): no unlimited-findMany warning.
           warnOnUnlimited: false,
         })

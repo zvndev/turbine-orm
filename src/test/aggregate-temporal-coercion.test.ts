@@ -125,3 +125,44 @@ describe('aggregate _min / _max temporal coercion', () => {
     assert.equal(infinities._max.at, Number.POSITIVE_INFINITY);
   });
 });
+
+describe('groupBy having: a Date operand binds the way a where operand does', () => {
+  // A zone-less `timestamp` holds UTC components (Turbine writes and reads it
+  // that way). node-postgres serializes a bound Date in the PROCESS zone and
+  // PostgreSQL drops the offset going into a zone-less timestamp, so a raw Date
+  // in `having` compared hours off in any non-UTC process. The where compiler
+  // binds the UTC-component literal; `having` must too.
+  const at = new Date('2024-01-15T12:00:00.000Z');
+
+  it('_max / _min over a zone-less timestamp bind the UTC literal, operators and lists included', () => {
+    const q = makeQuery('events', schema(), { warnOnUnlimited: false });
+    const where = q.buildFindMany({ where: { at } } as never);
+    const literal = where.params[0];
+    assert.equal(typeof literal, 'string', 'the where side binds a literal, not a Date');
+    const deferred = q.buildGroupBy({
+      by: ['id'],
+      _max: { at: true },
+      having: { at: { _max: { equals: at, gte: at }, _min: { in: [at] } } },
+    } as never);
+    const dates = deferred.params.filter((p) => p instanceof Date);
+    assert.deepEqual(dates, [], `no raw Date reaches the driver: ${JSON.stringify(deferred.params)}`);
+    assert.ok(deferred.params.includes(literal), JSON.stringify(deferred.params));
+    assert.ok(
+      deferred.params.some((p) => Array.isArray(p) && p[0] === literal),
+      JSON.stringify(deferred.params),
+    );
+  });
+
+  it('a bare Date operand binds the same literal', () => {
+    const q = makeQuery('events', schema(), { warnOnUnlimited: false });
+    const literal = q.buildFindMany({ where: { at } } as never).params[0];
+    const deferred = q.buildGroupBy({ by: ['id'], having: { at: { _max: at } } } as never);
+    assert.deepEqual(deferred.params, [literal]);
+  });
+
+  it('_count operands are untouched', () => {
+    const q = makeQuery('events', schema(), { warnOnUnlimited: false });
+    const deferred = q.buildGroupBy({ by: ['id'], having: { _count: { gt: 2 } } } as never);
+    assert.deepEqual(deferred.params, [2]);
+  });
+});

@@ -89,7 +89,7 @@ describe('prisma-compat, dropped options against a live database', () => {
     await pool.end();
   });
 
-  it('a filtered relation count is refused, and the unfiltered one is still the true total', async () => {
+  it('a filtered relation count is the filtered number, and the unfiltered one is still the true total', async () => {
     const total = await db.table('posts').count({ where: { userId: 1 } });
     const published = await db.table('posts').count({ where: { userId: 1, published: true } });
     assert.ok(published < total, 'the fixture must make the filtered and unfiltered numbers differ');
@@ -101,13 +101,11 @@ describe('prisma-compat, dropped options against a live database', () => {
     // An external pool keeps the driver's own int8 reading (a string), so only the count is compared.
     assert.deepEqual(unfiltered._count, { posts: total });
 
-    await assert.rejects(
-      compat.user.findUnique({
-        where: { id: 1 },
-        select: { id: true, _count: { select: { posts: { where: { published: true } } } } },
-      }),
-      /filtered relation count.*prisma\.post\.count/s,
-    );
+    const filtered = await compat.user.findUnique({
+      where: { id: 1 },
+      select: { id: true, _count: { select: { posts: { where: { published: true } } } } },
+    });
+    assert.deepEqual(filtered._count, { posts: published });
   });
 
   it('a misspelled `_count` is refused instead of counting nothing or everything', async () => {
