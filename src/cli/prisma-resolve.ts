@@ -436,11 +436,14 @@ function relationFkColumns(model: PrismaModel, field: PrismaModel['fields'][numb
  * Prisma CLIENT-side defaults for a resolved model: `@default(uuid())` /
  * `@default(cuid())` / `@updatedAt` are filled by the Prisma client (the
  * database column typically has NO default), so migrated call sites omit those
- * fields and a plain insert violates NOT NULL. `@default(now())` is normally a
- * database default, so it is carried only when the introspected column has no
- * default. `@updatedAt` is always carried (Prisma touches it on every update
- * regardless of any database default). Returns undefined when the model has
- * none, keeping the emitted map byte-identical for unaffected schemas.
+ * fields and a plain insert violates NOT NULL. `uuid()` / `cuid()` are carried
+ * only when the column has no database default (either one is an opaque random
+ * id). `@default(now())` and `@updatedAt` are ALWAYS carried: Prisma sends its
+ * own clock's time even when the migration also wrote `DEFAULT
+ * CURRENT_TIMESTAMP`, and the two clocks differ, so leaving `now()` to the
+ * database made a row stamped "now" compare as later than the app's
+ * `new Date()` taken right after the insert. Returns undefined when the model
+ * has none, keeping the emitted map byte-identical for unaffected schemas.
  */
 function collectClientDefaults(
   model: PrismaModel,
@@ -457,12 +460,15 @@ function collectClientDefaults(
       out[field.name] = 'updatedAt';
       continue;
     }
-    if (col?.hasDefault) continue; // the database fills it; nothing to emulate
     const def = field.attrs.find((a) => a.name === 'default');
     const raw = def?.args.find((a) => a.key === undefined && a.kind === 'raw')?.value ?? '';
+    if (/^now\s*\(\s*\)$/.test(raw)) {
+      out[field.name] = 'now';
+      continue;
+    }
+    if (col?.hasDefault) continue; // the database fills it; nothing to emulate
     if (/^uuid\s*\(/.test(raw)) out[field.name] = 'uuid';
     else if (/^cuid\s*\(/.test(raw)) out[field.name] = 'cuid';
-    else if (/^now\s*\(\s*\)$/.test(raw)) out[field.name] = 'now';
   }
   return Object.keys(out).length > 0 ? out : undefined;
 }

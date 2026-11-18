@@ -800,13 +800,14 @@ export interface PrismaModelMap {
   compoundUniques: Record<string, string[]>;
   /**
    * Prisma CLIENT-side default per Prisma field name. Prisma's
-   * `@default(uuid())` / `@default(cuid())` / `@updatedAt` (and `@default(now())`
-   * when the migration left no database default) are filled by the Prisma
-   * client, not the database, so the columns commonly have NO db default and a
-   * Prisma call site omits them. The compat adapter fills these on create
-   * (`uuid` / `cuid` / `now`) and touches `updatedAt` fields on
-   * update/updateMany/upsert, exactly like Prisma. Emitted by
-   * `migrate-from-prisma` only for columns the database does not default.
+   * `@default(uuid())` / `@default(cuid())` / `@default(now())` / `@updatedAt`
+   * are filled by the Prisma client, not the database, so the columns commonly
+   * have NO db default and a Prisma call site omits them. The compat adapter
+   * fills these on create (`uuid` / `cuid` / `now`), at every depth of a nested
+   * write, and touches `updatedAt` fields on update/updateMany/upsert, exactly
+   * like Prisma. `migrate-from-prisma` emits `uuid` / `cuid` only for columns the
+   * database does not default, and `now` / `updatedAt` always: Prisma stamps
+   * them with the app's clock even when the column has a database default.
    */
   clientDefaults?: Record<string, 'uuid' | 'cuid' | 'now' | 'updatedAt'>;
 }
