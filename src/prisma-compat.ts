@@ -231,6 +231,10 @@ export interface CompatTransactionClient {
 /** The minimal `TurbineClient` surface the adapter consumes. */
 export interface CompatTurbineClient extends CompatTransactionClient {
   readonly schema: SchemaMetadata;
+  /** Core `connect()`; absent on a test stub. */
+  connect?(): Promise<void>;
+  /** Core `disconnect()`; absent on a test stub. */
+  disconnect?(): Promise<unknown>;
   $transaction<R>(fn: (tx: CompatTransactionClient) => Promise<R>, options?: unknown): Promise<R>;
   $transaction(queries: readonly DeferredQuery<unknown>[], options?: unknown): Promise<unknown[]>;
 }
@@ -2587,7 +2591,13 @@ export interface PrismaCompatClientBase<S extends Record<string, PrismaModelType
    * extensions throw, see {@link PrismaCompatExtension}.
    */
   $extends<E extends PrismaCompatExtension>(extension: E): PrismaCompatExtendedClient<S, E>;
+  /** Open a connection now (core `connect()`: one `SELECT 1`), so a bad URL fails here rather than at the first query. */
   $connect(): Promise<void>;
+  /**
+   * Close the wrapped client's pool (core `disconnect()`), so a script can
+   * exit. Idempotent, and shared by every `$extends` of this client. Unlike
+   * Prisma the pool is not reopened by a later query: build a new client.
+   */
   $disconnect(): Promise<void>;
 }
 
@@ -3872,6 +3882,23 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
 
   const ph = placeholderOf(db);
 
+  // `$connect` / `$disconnect` used to be no-ops, so a script that ended with
+  // `await prisma.$disconnect()` kept the pool open and never exited. One
+  // closing promise per wrapped client: every extended client shares it, and a
+  // second call resolves with the first instead of ending the pool twice.
+  let closing: Promise<void> | undefined;
+  const lifecycle = {
+    connect: async (): Promise<void> => {
+      if (typeof db.connect === 'function') await db.connect();
+    },
+    disconnect: (): Promise<void> => {
+      closing ??= (async () => {
+        if (typeof db.disconnect === 'function') await db.disconnect();
+      })();
+      return closing;
+    },
+  };
+
   // Prefer the client's own raw seam, which emits a `$on('query')` event; a
   // client without one (an older core, a test stub) runs on the pool as before.
   const runRaw: RawExecutor = async (text, params, action) => {
@@ -4035,8 +4062,8 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
       }) as PrismaCompatClientBase['$extends'],
 
       ...makeRawSurface(runRaw, ph, ctx.fragmentOf),
-      $connect: async () => {},
-      $disconnect: async () => {},
+      $connect: () => lifecycle.connect(),
+      $disconnect: () => lifecycle.disconnect(),
     };
 
     // Assemble the result: model delegates keyed by Prisma model name, plus the
