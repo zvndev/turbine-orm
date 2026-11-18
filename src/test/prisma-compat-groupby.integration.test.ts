@@ -1,6 +1,7 @@
 /**
  * groupBy parity on a real Postgres, through prisma-compat and core: a Date in
- * `having` in a non-UTC process. Gated on `DATABASE_URL`.
+ * `having` in a non-UTC process, and result rows that carry only the blocks
+ * the call asked for. Gated on `DATABASE_URL`.
  */
 
 import assert from 'node:assert/strict';
@@ -67,5 +68,49 @@ describe('groupBy parity (real Postgres)', () => {
       // And the where side agrees, as it always did.
       assert.equal(await compat.member.count({ where: { workspaceId: w.id, createdAt: at } }), 1);
     });
+  });
+
+  it('groupBy rows carry only the blocks that were asked for', async () => {
+    const w = await fx.seedWorkspace('blocks');
+    for (const [id, name] of [
+      ['b1', 'x'],
+      ['b2', 'x'],
+      ['b3', 'y'],
+    ]) {
+      await fx.db.rawUnsafe(
+        `INSERT INTO ${fx.tables.label} (id, workspace_id, name) VALUES ($1, $2, $3)`,
+        `${id}-${w.id}`,
+        w.id,
+        name,
+      );
+    }
+    const where = { workspaceId: w.id };
+    assert.deepEqual(await compat.label.groupBy({ by: ['name'], where, orderBy: { name: 'asc' } }), [
+      { name: 'x' },
+      { name: 'y' },
+    ]);
+    assert.deepEqual(await compat.label.groupBy({ by: ['name'], where, _count: true, orderBy: { name: 'asc' } }), [
+      { name: 'x', _count: 2 },
+      { name: 'y', _count: 1 },
+    ]);
+    assert.deepEqual(
+      await compat.label.groupBy({ by: ['name'], where, _count: { _all: true }, orderBy: { name: 'asc' } }),
+      [
+        { name: 'x', _count: { _all: 2 } },
+        { name: 'y', _count: { _all: 1 } },
+      ],
+    );
+    // Ordering by the count still works without returning it.
+    assert.deepEqual(await compat.label.groupBy({ by: ['name'], where, orderBy: { _count: 'desc' } }), [
+      { name: 'x' },
+      { name: 'y' },
+    ]);
+    assert.deepEqual(
+      await compat.label.groupBy({ by: ['name'], where, _max: { color: true }, orderBy: { name: 'asc' } }),
+      [
+        { name: 'x', _max: { color: null } },
+        { name: 'y', _max: { color: null } },
+      ],
+    );
   });
 });

@@ -3316,17 +3316,27 @@ function makeDelegate(
         (qi, t) => qi.aggregate(t).then((r) => reshapeAggregate(ctx, mm, r)),
         { build: (qi, t) => qi.buildAggregate(t), reshape: (raw) => reshapeAggregate(ctx, mm, raw) },
       ) as unknown as Promise<Record<string, unknown>>,
-    groupBy: (args) =>
-      defer(
+    groupBy: (args) => {
+      // Core always counts a group when `_count` is omitted (its documented
+      // default); Prisma returns only the blocks the call names. The count
+      // still runs (an `orderBy: { _count }` reads it), it is just not handed
+      // back unasked.
+      const askedForCount = isPlainRecord(args) && args._count !== undefined && args._count !== false;
+      const reshape = (raw: unknown) =>
+        (raw as unknown[]).map((r) => {
+          const row = reshapeGroupRow(ctx, mm, r);
+          if (askedForCount || !isPlainRecord(row) || !Object.hasOwn(row, '_count')) return row;
+          const { _count: _dropped, ...rest } = row;
+          return rest;
+        });
+      return defer(
         'groupBy',
         args,
         () => translateAggregateArgs(ctx, mm, args as Args, true),
-        (qi, t) => qi.groupBy(t).then((rows) => (rows as unknown[]).map((r) => reshapeGroupRow(ctx, mm, r))),
-        {
-          build: (qi, t) => qi.buildGroupBy(t),
-          reshape: (raw) => (raw as unknown[]).map((r) => reshapeGroupRow(ctx, mm, r)),
-        },
-      ) as unknown as Promise<Record<string, unknown>[]>,
+        (qi, t) => qi.groupBy(t).then(reshape),
+        { build: (qi, t) => qi.buildGroupBy(t), reshape },
+      ) as unknown as Promise<Record<string, unknown>[]>;
+    },
   };
 }
 
