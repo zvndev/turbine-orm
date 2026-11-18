@@ -63,7 +63,9 @@
  * - `instanceof PrismaClientKnownRequestError`, `.meta`/message byte parity
  *   (opt into `prismaErrorCodes` for a `.code` like `P2002`, without pretending
  *   `instanceof` identity).
- * - `Prisma.join` / `Prisma.raw` composition beyond plain fragment flattening.
+ * - Splicing another library's `Prisma.sql` fragments unless asked to: they are
+ *   bound as values until the client is given that library's namespace
+ *   ({@link PrismaCompatOptions.prismaNamespace}).
  * - Fluent relation chaining (`prisma.user.findUnique().posts()`).
  * - Accelerate / Pulse / driver-adapter preview features, the Mongo API, and the
  *   `prisma migrate`/`db` CLI family (Turbine ships its own migrations).
@@ -283,6 +285,58 @@ type FragmentReader = (value: unknown) => SqlFragmentLike | undefined;
 const ownFragment: FragmentReader = (value) => (isSqlFragment(value) ? value : undefined);
 
 /**
+ * A reader that also splices fragments built by another library's `Prisma`
+ * namespace (in practice `@prisma/client`, whose `Prisma.sql` / `join` / `raw` /
+ * `empty` all return instances of one class that is not exported).
+ *
+ * Recognition is by PROTOTYPE IDENTITY with the namespace's own `empty`
+ * fragment, never by shape. A shape test (`strings` + `values` arrays) would
+ * splice a request body: `JSON.parse` happily produces
+ * `{ "strings": ["1; DROP TABLE t; --"], "values": [] }`, and that object sitting
+ * in `$queryRaw\`... ${body.filter}\`` would then be SQL rather than a bound
+ * value. A parsed body can never carry a class prototype, so it stays a value,
+ * exactly as it does in Prisma, which recognizes its fragments by `instanceof`.
+ */
+function foreignFragmentReader(namespace: PrismaNamespaceLike): FragmentReader {
+  const empty = (namespace as { empty?: unknown } | null | undefined)?.empty;
+  const proto = typeof empty === 'object' && empty !== null ? Object.getPrototypeOf(empty) : null;
+  if (proto === null || proto === Object.prototype || !hasFragmentParts(empty)) {
+    throw new ValidationError(
+      'prisma-compat: `prismaNamespace` takes the `Prisma` namespace of a client library ' +
+        '(`import { Prisma } from "@prisma/client"`), whose `Prisma.empty` is a fragment instance with ' +
+        '`strings` and `values` arrays. The value given has no such `empty`.',
+    );
+  }
+  return (value) => {
+    if (isSqlFragment(value)) return value;
+    if (typeof value !== 'object' || value === null || Object.getPrototypeOf(value) !== proto) return undefined;
+    if (!hasFragmentParts(value)) {
+      throw new ValidationError(
+        'prisma-compat: a fragment from the configured `prismaNamespace` does not have `strings` and `values` ' +
+          'arrays with one more string than values, so it cannot be composed.',
+      );
+    }
+    return value;
+  };
+}
+
+function hasFragmentParts(value: unknown): value is SqlFragmentLike {
+  const { strings, values } = value as { strings?: unknown; values?: unknown };
+  return (
+    Array.isArray(strings) &&
+    Array.isArray(values) &&
+    strings.length === values.length + 1 &&
+    strings.every((part) => typeof part === 'string')
+  );
+}
+
+/** The part of a client library's `Prisma` namespace {@link PrismaCompatOptions.prismaNamespace} reads. */
+export interface PrismaNamespaceLike {
+  /** `Prisma.empty`: an instance of the library's fragment class. */
+  readonly empty: object;
+}
+
+/**
  * `Prisma`-compatible raw-SQL helpers, a minimal local implementation so
  * migrated `Prisma.sql\`…\`` / `Prisma.join(...)` / `Prisma.raw(...)` calls keep
  * composing. Fragments are flattened at execution time into a single
@@ -358,6 +412,27 @@ export interface PrismaCompatOptions {
    * `false` (Turbine's own `TURBINE_E0NN` codes are preserved untouched).
    */
   prismaErrorCodes?: boolean;
+  /**
+   * The `Prisma` namespace of the client library the call sites were written
+   * against (`import { Prisma } from '@prisma/client'`). With it, fragments that
+   * library builds (`Prisma.sql`, `Prisma.join`, `Prisma.raw`, `Prisma.empty`)
+   * compose in `$queryRaw` / `$executeRaw` exactly like this module's own: nested
+   * in a template, as the lone argument, and inside each other. Without it they
+   * are bound as `$N` values, which is the safe reading of an object nobody vouched
+   * for.
+   *
+   * Only instances of the namespace's own fragment class are spliced (recognized
+   * by prototype, never by shape), so an object parsed from a request body is a
+   * value whatever keys it carries.
+   *
+   * @example
+   * ```ts
+   * import { Prisma } from '@prisma/client';
+   * const prisma = createPrismaCompatClient(db, PRISMA_MAP, { prismaNamespace: Prisma });
+   * await prisma.$queryRaw`SELECT * FROM "User" WHERE id IN (${Prisma.join(ids)})`;
+   * ```
+   */
+  prismaNamespace?: PrismaNamespaceLike;
 }
 
 /** Turbine error code → nearest Prisma `PXXXX` code. */
@@ -2881,6 +2956,16 @@ function makeRawSurface(
       }
       return flattenTemplate(fragment.strings, fragment.values, ph, fragmentOf);
     }
+    // Anything else that is not a template's strings array (a plain string, an
+    // object that is not a recognized fragment) would flatten to an empty or
+    // character-split statement. Prisma refuses those too.
+    if (!Array.isArray(first)) {
+      throw new ValidationError(
+        `prisma-compat: ${method} takes a tagged template (${method}\`SELECT ...\`) or one fragment ` +
+          `(${method}(Prisma.sql\`SELECT ...\`)), received ${describeValue(first)}. ` +
+          `For SQL text built at runtime use ${method}Unsafe(text, ...values).`,
+      );
+    }
     return flattenTemplate(first as unknown as string[], values, ph, fragmentOf);
   };
   return {
@@ -3184,7 +3269,7 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
       stablePkOrder: options.stablePkOrder ?? false,
       prismaErrorCodes: options.prismaErrorCodes ?? false,
     },
-    fragmentOf: ownFragment,
+    fragmentOf: options.prismaNamespace === undefined ? ownFragment : foreignFragmentReader(options.prismaNamespace),
   };
 
   // Every model the client exposes: the map's Prisma models, plus the implicit
