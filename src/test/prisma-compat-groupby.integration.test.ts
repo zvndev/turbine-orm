@@ -1,12 +1,13 @@
 /**
- * groupBy parity on a real Postgres, through prisma-compat and core: a Date in
- * `having` in a non-UTC process, and result rows that carry only the blocks
- * the call asked for. Gated on `DATABASE_URL`.
+ * groupBy and raw SQL parity on a real Postgres, through prisma-compat and
+ * core: a Date in `having`, and in raw SQL, in a non-UTC process; and groupBy
+ * result rows that carry only the blocks the call asked for. Gated on
+ * `DATABASE_URL`.
  */
 
 import assert from 'node:assert/strict';
 import { describe } from 'node:test';
-import { createPrismaCompatClient } from '../prisma-compat.js';
+import { createPrismaCompatClient, Prisma } from '../prisma-compat.js';
 import { skipGate } from './helpers.js';
 import { type ParityFixture, setupParityFixture } from './prisma-parity-fixture.js';
 
@@ -67,6 +68,42 @@ describe('groupBy parity (real Postgres)', () => {
       assert.equal(core.length, 1);
       // And the where side agrees, as it always did.
       assert.equal(await compat.member.count({ where: { workspaceId: w.id, createdAt: at } }), 1);
+    });
+  });
+
+  it('a Date in raw SQL compares as UTC in a non-UTC process, as Prisma binds it', async () => {
+    const w = await fx.seedWorkspace('raw-date');
+    await fx.db.rawUnsafe(
+      `INSERT INTO ${fx.tables.member} (id, workspace_id, role, created_at) VALUES ($1, $2, 'owner', '2024-01-15 12:00:00.123')`,
+      `rd-${w.id}`,
+      w.id,
+    );
+    const at = new Date('2024-01-15T12:00:00.123Z');
+    const table = Prisma.raw(fx.tables.member);
+    await inNewYork(async () => {
+      assert.deepEqual(
+        await compat.$queryRaw`SELECT count(*)::int AS n FROM ${table} WHERE workspace_id = ${w.id} AND created_at = ${at}`,
+        [{ n: 1 }],
+      );
+      assert.deepEqual(
+        await compat.$queryRawUnsafe(
+          `SELECT count(*)::int AS n FROM ${fx.tables.member} WHERE workspace_id = $1 AND created_at = $2`,
+          w.id,
+          at,
+        ),
+        [{ n: 1 }],
+      );
+      await compat.$transaction(async (tx: typeof compat) => {
+        assert.equal(
+          await tx.$executeRaw`UPDATE ${table} SET role = 'admin' WHERE workspace_id = ${w.id} AND created_at = ${at}`,
+          1,
+        );
+      });
+      // A timestamptz comparison is right too: the ISO text carries its zone.
+      assert.deepEqual(
+        await compat.$queryRaw`SELECT (${at}::timestamptz = '2024-01-15T12:00:00.123Z'::timestamptz) AS same`,
+        [{ same: true }],
+      );
     });
   });
 
