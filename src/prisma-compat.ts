@@ -267,6 +267,21 @@ function makeSql(strings: readonly string[], values: readonly unknown[]): Sql {
   return { strings, values, [SQL_FRAGMENT]: true };
 }
 
+/** The structural shape of a fragment: this module's {@link Sql}, or another library's. */
+export interface SqlFragmentLike {
+  readonly strings: readonly string[];
+  readonly values: readonly unknown[];
+}
+
+/**
+ * Answers whether a raw-SQL argument is a fragment to splice, and if so its
+ * parts. Anything it does not recognize is a VALUE and is bound as `$N`.
+ */
+type FragmentReader = (value: unknown) => SqlFragmentLike | undefined;
+
+/** The default reader: this module's own branded fragments only. */
+const ownFragment: FragmentReader = (value) => (isSqlFragment(value) ? value : undefined);
+
 /**
  * `Prisma`-compatible raw-SQL helpers, a minimal local implementation so
  * migrated `Prisma.sql\`…\`` / `Prisma.join(...)` / `Prisma.raw(...)` calls keep
@@ -391,7 +406,9 @@ interface Ctx {
   /** turbine table name → prisma model name. */
   tableToModel: Map<string, string>;
   lookups: Map<string, ModelLookups>;
-  options: Required<PrismaCompatOptions>;
+  options: Required<Pick<PrismaCompatOptions, 'stablePkOrder' | 'prismaErrorCodes'>>;
+  /** Which raw-SQL arguments are fragments (see {@link PrismaCompatOptions.prismaNamespace}). */
+  fragmentOf: FragmentReader;
 }
 
 const TIME_PG_TYPES = new Set(['time', 'time without time zone', 'timetz', 'time with time zone']);
@@ -2103,9 +2120,11 @@ export interface PrismaModelDelegate<M extends PrismaModelTypes> {
  * the transaction's own connection.
  */
 export interface PrismaCompatRawSurface {
-  $queryRaw<T = unknown>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T[]>;
+  /** A tagged template, or one fragment (`$queryRaw(Prisma.sql\`...\`)`), as in Prisma. */
+  $queryRaw<T = unknown>(strings: TemplateStringsArray | SqlFragmentLike, ...values: unknown[]): Promise<T[]>;
   $queryRawUnsafe<T = unknown>(sql: string, ...params: unknown[]): Promise<T[]>;
-  $executeRaw(strings: TemplateStringsArray, ...values: unknown[]): Promise<number>;
+  /** A tagged template, or one fragment (`$executeRaw(Prisma.sql\`...\`)`), as in Prisma. */
+  $executeRaw(strings: TemplateStringsArray | SqlFragmentLike, ...values: unknown[]): Promise<number>;
   $executeRawUnsafe(sql: string, ...params: unknown[]): Promise<number>;
 }
 
@@ -2801,6 +2820,7 @@ function flattenTemplate(
   strings: readonly string[],
   values: readonly unknown[],
   ph: (n: number) => string,
+  fragmentOf: FragmentReader,
 ): { text: string; params: unknown[] } {
   const params: unknown[] = [];
   let text = '';
@@ -2809,8 +2829,9 @@ function flattenTemplate(
       text += segStrings[i];
       if (i < segValues.length) {
         const v = segValues[i];
-        if (isSqlFragment(v)) {
-          append(v.strings, v.values);
+        const fragment = fragmentOf(v);
+        if (fragment) {
+          append(fragment.strings, fragment.values);
         } else {
           params.push(v);
           text += ph(params.length);
@@ -2837,17 +2858,44 @@ type RawExecutor = (
  * (`$queryRaw` → rows, `$executeRaw` → affected-row count). The only difference
  * is which connection the executor runs on.
  */
-function makeRawSurface(exec: RawExecutor, ph: (n: number) => string): PrismaCompatRawSurface {
+function makeRawSurface(
+  exec: RawExecutor,
+  ph: (n: number) => string,
+  fragmentOf: FragmentReader,
+): PrismaCompatRawSurface {
+  /**
+   * The statement a `$queryRaw` / `$executeRaw` call means. Prisma takes either a
+   * tagged template or ONE fragment (`$queryRaw(Prisma.sql\`...\`)`). The
+   * fragment form used to be read as a template whose `strings` was the
+   * fragment object itself, which has no indices, so the statement sent was the
+   * empty string and the call resolved to `[]` without a word.
+   */
+  const compose = (first: TemplateStringsArray | SqlFragmentLike, values: unknown[], method: string) => {
+    const fragment = fragmentOf(first);
+    if (fragment) {
+      if (values.length > 0) {
+        throw new ValidationError(
+          `prisma-compat: ${method}(fragment) takes the fragment alone; ${values.length} further ` +
+            'argument(s) would be ignored. Interpolate the values inside the fragment instead.',
+        );
+      }
+      return flattenTemplate(fragment.strings, fragment.values, ph, fragmentOf);
+    }
+    return flattenTemplate(first as unknown as string[], values, ph, fragmentOf);
+  };
   return {
-    $queryRaw: async <T = unknown>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T[]> => {
-      const { text, params } = flattenTemplate(strings as unknown as string[], values, ph);
+    $queryRaw: async <T = unknown>(
+      strings: TemplateStringsArray | SqlFragmentLike,
+      ...values: unknown[]
+    ): Promise<T[]> => {
+      const { text, params } = compose(strings, values, '$queryRaw');
       return (await exec(text, params, '$queryRaw')).rows as T[];
     },
     $queryRawUnsafe: async <T = unknown>(sql: string, ...params: unknown[]): Promise<T[]> => {
       return (await exec(sql, params, '$queryRawUnsafe')).rows as T[];
     },
-    $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]): Promise<number> => {
-      const { text, params } = flattenTemplate(strings as unknown as string[], values, ph);
+    $executeRaw: async (strings: TemplateStringsArray | SqlFragmentLike, ...values: unknown[]): Promise<number> => {
+      const { text, params } = compose(strings, values, '$executeRaw');
       return (await exec(text, params, '$executeRaw')).rowCount ?? 0;
     },
     $executeRawUnsafe: async (sql: string, ...params: unknown[]): Promise<number> => {
@@ -3136,6 +3184,7 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
       stablePkOrder: options.stablePkOrder ?? false,
       prismaErrorCodes: options.prismaErrorCodes ?? false,
     },
+    fragmentOf: ownFragment,
   };
 
   // Every model the client exposes: the map's Prisma models, plus the implicit
@@ -3310,7 +3359,10 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
           // the common case in a migrated codebase. No model can shadow them: a
           // Prisma model name cannot start with `$`, and junction accessors skip
           // every CLIENT_RESERVED_KEYS name.
-          const txClient: Record<string, unknown> = { ...txDelegates, ...makeRawSurface(txRunRaw(tx), ph) };
+          const txClient: Record<string, unknown> = {
+            ...txDelegates,
+            ...makeRawSurface(txRunRaw(tx), ph, ctx.fragmentOf),
+          };
           return fn(txClient as unknown as PrismaCompatTransactionClient);
         }, txOptions);
       }) as PrismaCompatClientBase['$transaction'],
@@ -3321,7 +3373,7 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
         return build(applyExtension(exts, extension as PrismaCompatExtension, modelKeys, clientKeys));
       }) as PrismaCompatClientBase['$extends'],
 
-      ...makeRawSurface(runRaw, ph),
+      ...makeRawSurface(runRaw, ph, ctx.fragmentOf),
       $connect: async () => {},
       $disconnect: async () => {},
     };
