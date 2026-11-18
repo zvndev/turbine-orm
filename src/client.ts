@@ -32,10 +32,14 @@ import {
 } from './connection-guard.js';
 import {
   type ConnectionTarget,
+  detectPooler,
   detectPoolerTarget,
   fillTargetFromEnvironment,
+  type PrismaUrlParameters,
   parseConnectionTarget,
+  readPrismaUrlParameters,
   statementTimeoutSetting,
+  withSearchPathOption,
   withStartupSetting,
 } from './connection-url.js';
 import { type DiagnosticsConfig, type ResolvedDiagnostics, resolveDiagnostics } from './diagnostics.js';
@@ -1262,6 +1266,35 @@ function pgEnv(name: string): string | undefined {
 }
 
 /** Whether any explicit connection field suppresses the environment URL fallback. */
+/**
+ * {@link readPrismaUrlParameters} for a connection string this client will
+ * open, with the refusals raised: an invalid value, and a non-public `schema`
+ * that cannot be pinned safely. A `search_path` rides the connection's startup
+ * `options`, which a transaction pooler drops or refuses, and the alternative
+ * (a session `SET`) leaks to the next client of a pooled backend; querying the
+ * wrong schema is the outcome this exists to prevent, so both are E003.
+ */
+function readPrismaUrlParametersFor(connectionString: string, label: string): PrismaUrlParameters | null {
+  const params = readPrismaUrlParameters(connectionString);
+  if (!params) return null;
+  if (params.invalid) throw new ValidationError(`${label}: ${params.invalid}.`);
+  if (params.schema !== undefined && params.schema !== 'public') {
+    if (detectPooler(connectionString).pooled) {
+      throw new ValidationError(
+        `${label} names schema "${params.schema}" on what looks like a transaction pooler. A pooler cannot ` +
+          'carry a per-connection search_path; point the client at the direct endpoint, or use the public schema.',
+      );
+    }
+    if (withSearchPathOption(params.connectionString, params.schema, [], { quotedNames: true }) === null) {
+      throw new ValidationError(
+        `${label}: schema "${params.schema}" cannot be set as the connection's search_path (it may not contain ` +
+          'whitespace, a double quote or a backslash).',
+      );
+    }
+  }
+  return params;
+}
+
 function hasExplicitConnectionTarget(config: TurbineConfig): boolean {
   return (
     config.connectionString != null ||
@@ -2101,9 +2134,11 @@ export class TurbineClient {
     // `connectionString: process.env.DATABASE_URL ?? ''` must keep constructing,
     // and it still suppresses the DATABASE_URL fallback because
     // `hasExplicitConnection` tests `!= null`, not truthiness.
+    let prismaUrl: PrismaUrlParameters | null = null;
     if (!config.pool) {
       if (config.connectionString) {
         assertUsableConnectionString(config.connectionString, 'connectionString');
+        prismaUrl = readPrismaUrlParametersFor(config.connectionString, 'connectionString');
       } else if (
         config.connectionString == null &&
         config.host == null &&
@@ -2114,6 +2149,7 @@ export class TurbineClient {
         process.env.DATABASE_URL
       ) {
         assertUsableConnectionString(process.env.DATABASE_URL, 'DATABASE_URL environment variable');
+        prismaUrl = readPrismaUrlParametersFor(process.env.DATABASE_URL, 'DATABASE_URL environment variable');
       }
     }
     for (const [i, replica] of (config.replicas ?? []).entries()) {
@@ -2319,6 +2355,29 @@ export class TurbineClient {
 
       if (config.ssl !== undefined) {
         poolConfig.ssl = config.ssl;
+      }
+
+      // Prisma's `schema` / `connection_limit` / `pool_timeout` (read and
+      // validated above): stripped from what pg sees, and honoured. An explicit
+      // client option wins over the URL's.
+      if (prismaUrl && poolConfig.connectionString) {
+        poolConfig.connectionString = prismaUrl.connectionString;
+        if (prismaUrl.connectionLimit !== undefined && config.poolSize == null && config.max == null) {
+          poolConfig.max = prismaUrl.connectionLimit;
+        }
+        if (
+          prismaUrl.poolTimeoutMs !== undefined &&
+          config.connectionTimeoutMs == null &&
+          config.connectionTimeoutMillis == null
+        ) {
+          poolConfig.connectionTimeoutMillis = prismaUrl.poolTimeoutMs;
+        }
+        if (prismaUrl.schema !== undefined && prismaUrl.schema !== 'public') {
+          // Checked non-null when it was read.
+          poolConfig.connectionString =
+            withSearchPathOption(poolConfig.connectionString, prismaUrl.schema, [], { quotedNames: true }) ??
+            poolConfig.connectionString;
+        }
       }
 
       // Held as a `pg.Pool` for the length of this block: `PgCompatPool.on` is
