@@ -132,7 +132,7 @@
 // Type-only import: erased at runtime, so it introduces NO runtime cycle (core
 // never imports this subpath). It lets the public factory accept the real
 // `TurbineClient` for first-class consumer DX.
-import type { TurbineClient } from './client.js';
+import type { TransactionClient, TurbineClient } from './client.js';
 import { resolveDiagnostics } from './diagnostics.js';
 import { TurbineError, TurbineErrorCode, UnsupportedFeatureError, ValidationError, wrapPgError } from './errors.js';
 import { CLIENT_LOG_CONTEXT, type ClientLogContext, consoleLogger, logTo } from './logger.js';
@@ -2990,6 +2990,90 @@ function makeRawSurface(
 }
 
 // ---------------------------------------------------------------------------
+// Core interop: the Turbine client under a compat client
+// ---------------------------------------------------------------------------
+
+/**
+ * Every compat client and transaction client this module builds, mapped to the
+ * core client or core transaction it runs on. A WeakMap rather than a property,
+ * so nothing is added to a surface whose every key is a model name or a Prisma
+ * `$` member, and a hand-made lookalike object is never mistaken for one.
+ */
+const CORE_OF = new WeakMap<object, unknown>();
+
+/** Each compat client's way of wrapping a core transaction it did not open. */
+const BIND_OF = new WeakMap<object, (tx: CompatTransactionClient) => Record<string, unknown>>();
+
+/**
+ * The Turbine client under a compat client: the `TurbineClient` it wraps for the
+ * client (or any `$extends` of it), and the core `TransactionClient` for the `tx`
+ * a `$transaction(async (tx) => ...)` callback receives (or one
+ * {@link bindTransaction} made). This is how code is moved off the compat surface
+ * one module at a time: a ported function takes the compat client, calls
+ * `turbineOf`, and uses Turbine's own API on the SAME connection, so inside a
+ * transaction it sees that transaction's uncommitted writes and is rolled back
+ * with it.
+ *
+ * Throws for anything this module did not build.
+ *
+ * @example
+ * ```ts
+ * await prisma.$transaction(async (tx) => {
+ *   await tx.user.update({ where: { id }, data: { name } });
+ *   const user = await turbineOf(tx).table('users').findUnique({ where: { id } }); // same transaction
+ * });
+ * ```
+ */
+export function turbineOf<S extends Record<string, PrismaModelTypes>>(compat: PrismaCompatClient<S>): TurbineClient;
+export function turbineOf<S extends Record<string, PrismaModelTypes>>(
+  tx: PrismaCompatTransactionClient<S>,
+): TransactionClient;
+export function turbineOf(compat: object): TurbineClient | TransactionClient;
+export function turbineOf(compat: object): TurbineClient | TransactionClient {
+  const core = typeof compat === 'object' && compat !== null ? CORE_OF.get(compat) : undefined;
+  if (core === undefined) {
+    throw new ValidationError(
+      'prisma-compat: turbineOf takes a client made by createPrismaCompatClient, or the `tx` one of its ' +
+        '$transaction callbacks receives.',
+    );
+  }
+  return core as TurbineClient | TransactionClient;
+}
+
+/**
+ * A compat transaction client running inside a core transaction this layer did
+ * not open: the other direction of {@link turbineOf}. Code already on Turbine's API
+ * opens `db.$transaction(async (core) => ...)` and calls into a module still
+ * written against the Prisma surface with `bindTransaction(prisma, core)`; every
+ * delegate call and raw statement on the result runs on `core`'s connection and
+ * commits or rolls back with it. The result has the same members as the `tx` of
+ * a compat `$transaction` callback (delegates, extension `model` members, the
+ * raw surface), and no `$transaction` of its own, as in Prisma.
+ *
+ * @example
+ * ```ts
+ * await db.$transaction(async (core) => {
+ *   await core.table('users').update({ where: { id }, data: { name } });
+ *   await legacyAudit(bindTransaction(prisma, core)); // still prisma.auditLog.create(...)
+ * });
+ * ```
+ */
+export function bindTransaction<S extends Record<string, PrismaModelTypes>>(
+  compat: PrismaCompatClient<S>,
+  tx: TransactionClient,
+): PrismaCompatTransactionClient<S>;
+export function bindTransaction(compat: object, tx: TransactionClient): PrismaCompatTransactionClient;
+export function bindTransaction(compat: object, tx: TransactionClient): PrismaCompatTransactionClient {
+  const bind = typeof compat === 'object' && compat !== null ? BIND_OF.get(compat) : undefined;
+  if (!bind) {
+    throw new ValidationError(
+      'prisma-compat: bindTransaction takes a client made by createPrismaCompatClient (not a transaction client).',
+    );
+  }
+  return bind(tx as unknown as CompatTransactionClient) as unknown as PrismaCompatTransactionClient;
+}
+
+// ---------------------------------------------------------------------------
 // createPrismaCompatClient
 // ---------------------------------------------------------------------------
 
@@ -3362,6 +3446,48 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
    * transaction. Absent, it is a TypeError at the call site instead.
    */
   const build = (exts: ExtensionState): PrismaCompatClient<S> => {
+    /**
+     * The transaction-scoped compat client over ONE core transaction: a delegate
+     * per model (both spellings), extended like the base ones, plus the raw
+     * surface on the transaction's own connection. The callback `$transaction`
+     * and {@link bindTransaction} both build it here, so a transaction this
+     * layer opened and one it was handed cannot differ.
+     */
+    const txClientFor = (tx: CompatTransactionClient): Record<string, unknown> => {
+      const txDelegates: Record<string, PrismaModelDelegate<PrismaModelTypes>> = {};
+      for (const [prismaModel, mm] of delegateModels) {
+        setOwn(
+          txDelegates,
+          prismaModel,
+          extendDelegate(
+            makeDelegate(
+              ctx,
+              mm,
+              () => tx.table(mm.table),
+              (fn) => fn((n) => tx.table(n)),
+            ),
+            prismaModel,
+            exts,
+          ),
+        );
+        const alias = prismaPropertyAlias(prismaModel);
+        if (alias && !Object.hasOwn(map.models, alias) && !Object.hasOwn(txDelegates, alias)) {
+          setOwn(txDelegates, alias, ownLookup(txDelegates, prismaModel));
+        }
+      }
+      // Raw SQL on the transaction's own connection. Prisma's tx client
+      // carries these four, and code that mixes `$transaction` with raw SQL is
+      // the common case in a migrated codebase. No model can shadow them: a
+      // Prisma model name cannot start with `$`, and junction accessors skip
+      // every CLIENT_RESERVED_KEYS name.
+      const txClient: Record<string, unknown> = {
+        ...txDelegates,
+        ...makeRawSurface(txRunRaw(tx), ph, ctx.fragmentOf),
+      };
+      CORE_OF.set(txClient, tx);
+      return txClient;
+    };
+
     // Delegates bound to the base client, extended where the extension has
     // members for them. `baseDelegates` is built ONCE (outside), so a client
     // whose extension only adds `client` members shares the very same delegate
@@ -3417,39 +3543,10 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
         }
         // Callback form: hand the user a compat client bound to the tx connection.
         const fn = arg as (tx: PrismaCompatTransactionClient) => Promise<unknown>;
-        return db.$transaction((tx: CompatTransactionClient) => {
-          const txDelegates: Record<string, PrismaModelDelegate<PrismaModelTypes>> = {};
-          for (const [prismaModel, mm] of delegateModels) {
-            setOwn(
-              txDelegates,
-              prismaModel,
-              extendDelegate(
-                makeDelegate(
-                  ctx,
-                  mm,
-                  () => tx.table(mm.table),
-                  (fn) => fn((n) => tx.table(n)),
-                ),
-                prismaModel,
-                exts,
-              ),
-            );
-            const alias = prismaPropertyAlias(prismaModel);
-            if (alias && !Object.hasOwn(map.models, alias) && !Object.hasOwn(txDelegates, alias)) {
-              setOwn(txDelegates, alias, ownLookup(txDelegates, prismaModel));
-            }
-          }
-          // Raw SQL on the transaction's own connection. Prisma's tx client
-          // carries these four, and code that mixes `$transaction` with raw SQL is
-          // the common case in a migrated codebase. No model can shadow them: a
-          // Prisma model name cannot start with `$`, and junction accessors skip
-          // every CLIENT_RESERVED_KEYS name.
-          const txClient: Record<string, unknown> = {
-            ...txDelegates,
-            ...makeRawSurface(txRunRaw(tx), ph, ctx.fragmentOf),
-          };
-          return fn(txClient as unknown as PrismaCompatTransactionClient);
-        }, txOptions);
+        return db.$transaction(
+          (tx: CompatTransactionClient) => fn(txClientFor(tx) as unknown as PrismaCompatTransactionClient),
+          txOptions,
+        );
       }) as PrismaCompatClientBase['$transaction'],
 
       $extends: ((extension: unknown): unknown => {
@@ -3478,6 +3575,16 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
     // client keys in applyExtension, so this can never overwrite a delegate.
     Object.assign(result, exts.client);
 
+    CORE_OF.set(result, client);
+    BIND_OF.set(result, (tx) => {
+      if (tx === (client as unknown) || typeof (tx as { table?: unknown } | null)?.table !== 'function') {
+        throw new ValidationError(
+          'prisma-compat: bindTransaction takes the core transaction client a `$transaction(async (tx) => ...)` ' +
+            'callback receives on the TurbineClient this compat client wraps.',
+        );
+      }
+      return txClientFor(tx);
+    });
     return result as unknown as PrismaCompatClient<S>;
   };
 
