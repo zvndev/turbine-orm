@@ -2004,7 +2004,7 @@ function translateWriteData(ctx: Ctx, mm: PrismaModelMap, data: unknown, depth =
     const rel = ownLookup(mm.relations, key);
     if (rel && isPlainRecord(val) && Object.keys(val).some((k) => NESTED_WRITE_OPS.has(k))) {
       const target = relTargetModel(ctx, mm, rel.name);
-      setOwn(out, rel.name, translateNestedWrite(ctx, target, val, depth + 1));
+      setOwn(out, rel.name, translateNestedWrite(ctx, target, val, depth + 1, rel.cardinality === 'one'));
       continue;
     }
     setOwn(out, renameField(mm, key), val);
@@ -2040,13 +2040,23 @@ function translateNestedWrite(
   target: PrismaModelMap | undefined,
   ops: Record<string, unknown>,
   depth: number,
+  toOne = false,
 ): unknown {
   const out: Record<string, unknown> = {};
+  // Rows a nested write CREATES get the target model's client defaults
+  // (`cuid()` / `uuid()` ids, `@default(now())`, `@updatedAt`) and rows it
+  // UPDATES get `@updatedAt`, exactly as the top-level row does: Prisma fills
+  // them at every depth, and a nested row without its id reached the database
+  // as NULL.
+  const created = (p: unknown) =>
+    target ? translateWriteData(ctx, target, applyCreateDefaults(target, p), depth + 1) : p;
   for (const [op, payload] of Object.entries(ops)) {
     switch (op) {
       case 'create':
+        out[op] = mapMaybeArray(payload, created);
+        break;
       case 'createMany':
-        out[op] = mapMaybeArray(payload, (p) => (target ? translateWriteData(ctx, target, p, depth + 1) : p));
+        out[op] = translateNestedCreateMany(payload, created);
         break;
       case 'connect':
       case 'disconnect':
@@ -2055,9 +2065,18 @@ function translateNestedWrite(
         out[op] = mapMaybeArray(payload, (p) => (target ? translateWhere(ctx, target, p, depth + 1) : p));
         break;
       case 'deleteMany':
-      case 'updateMany':
-      case 'update':
         out[op] = mapMaybeArray(payload, (p) => translateWhereDataPair(ctx, target, op, p, depth + 1));
+        break;
+      case 'updateMany':
+        out[op] = mapMaybeArray(payload, (p) => translateWhereDataPair(ctx, target, op, p, depth + 1, true));
+        break;
+      case 'update':
+        out[op] = mapMaybeArray(payload, (p) => {
+          const pair = translateWhereDataPair(ctx, target, op, p, depth + 1, true);
+          // Prisma's to-one `update` takes the data itself (`profile: { update:
+          // { bio } }`) as well as `{ data }`; core reads `{ data }`.
+          return toOne && isPlainRecord(p) && !('data' in p) && !('where' in p) ? { data: pair } : pair;
+        });
         break;
       case 'connectOrCreate':
         out[op] = mapMaybeArray(payload, (p) => translateConnectOrCreate(ctx, target, p, depth + 1));
@@ -2100,16 +2119,32 @@ function translateWhereDataPair(
   op: string,
   p: unknown,
   depth: number,
+  touch = false,
 ): unknown {
   if (!isPlainRecord(p)) return p;
+  const data = (d: unknown) =>
+    target ? translateWriteData(ctx, target, touch ? applyUpdateTouch(target, d) : d, depth) : d;
   if ('data' in p || 'where' in p) {
     assertNestedPayloadKeys(op, p, ['where', 'data']);
     const out: Record<string, unknown> = {};
     if (p.where !== undefined) out.where = target ? translateWhere(ctx, target, p.where, depth) : p.where;
-    if (p.data !== undefined) out.data = target ? translateWriteData(ctx, target, p.data, depth) : p.data;
+    if (p.data !== undefined) out.data = data(p.data);
     return out;
   }
-  return target ? translateWriteData(ctx, target, p, depth) : p;
+  return data(p);
+}
+
+/**
+ * A nested `createMany: { data, skipDuplicates }`. Its rows are translated (and
+ * get client defaults) like nested `create` rows; the wrapper keys pass through
+ * for core to validate.
+ */
+function translateNestedCreateMany(payload: unknown, created: (row: unknown) => unknown): unknown {
+  if (!isPlainRecord(payload)) return payload;
+  assertNestedPayloadKeys('createMany', payload, ['data', 'skipDuplicates']);
+  const out: Record<string, unknown> = { ...payload };
+  if (payload.data !== undefined) out.data = mapMaybeArray(payload.data, created);
+  return out;
 }
 
 function translateConnectOrCreate(ctx: Ctx, target: PrismaModelMap | undefined, p: unknown, depth: number): unknown {
@@ -2117,7 +2152,9 @@ function translateConnectOrCreate(ctx: Ctx, target: PrismaModelMap | undefined, 
   assertNestedPayloadKeys('connectOrCreate', p, ['where', 'create']);
   const out: Record<string, unknown> = {};
   if (p.where !== undefined) out.where = target ? translateWhere(ctx, target, p.where, depth) : p.where;
-  if (p.create !== undefined) out.create = target ? translateWriteData(ctx, target, p.create, depth) : p.create;
+  if (p.create !== undefined) {
+    out.create = target ? translateWriteData(ctx, target, applyCreateDefaults(target, p.create), depth) : p.create;
+  }
   return out;
 }
 
@@ -2126,8 +2163,12 @@ function translateUpsertNested(ctx: Ctx, target: PrismaModelMap | undefined, p: 
   assertNestedPayloadKeys('upsert', p, ['where', 'create', 'update']);
   const out: Record<string, unknown> = {};
   if (p.where !== undefined) out.where = target ? translateWhere(ctx, target, p.where, depth) : p.where;
-  if (p.create !== undefined) out.create = target ? translateWriteData(ctx, target, p.create, depth) : p.create;
-  if (p.update !== undefined) out.update = target ? translateWriteData(ctx, target, p.update, depth) : p.update;
+  if (p.create !== undefined) {
+    out.create = target ? translateWriteData(ctx, target, applyCreateDefaults(target, p.create), depth) : p.create;
+  }
+  if (p.update !== undefined) {
+    out.update = target ? translateWriteData(ctx, target, applyUpdateTouch(target, p.update), depth) : p.update;
+  }
   return out;
 }
 
@@ -2954,6 +2995,24 @@ function makeDelegate(
     return async (table) => readWritten(table, primaryKeyWhere(op, await write(table(mm.table))), a);
   };
 
+  /**
+   * A write's own row, Prisma-shaped. Core returns the relations a nested write
+   * touched (it reads the written tree back); a Prisma write without `include`
+   * returns scalars only, so those keys are dropped rather than handed to a
+   * caller who never asked for them.
+   */
+  const writtenRow = (raw: unknown): unknown => {
+    const row = reshapeRow(ctx, mm, raw);
+    if (!isPlainRecord(row)) return row;
+    let out = row;
+    for (const key of Object.keys(row)) {
+      if (key !== '_count' && ownLookup(mm.relations, key) === undefined) continue;
+      if (out === row) out = { ...row };
+      delete out[key];
+    }
+    return out;
+  };
+
   const requireWhere = (args: Args | undefined, op: string): Args => {
     if (!args || args.where === undefined) {
       throw new ValidationError(`prisma-compat: ${op} on "${modelName(ctx, mm)}" requires a \`where\`.`);
@@ -3011,7 +3070,7 @@ function makeDelegate(
       // Resolved inside the translate thunk below (so it validates before the
       // write runs and stays deferred), read back by every result path.
       let proj: WriteProjection = NO_WRITE_PROJECTION;
-      const shape = (raw: unknown) => applyWriteProjection(proj, reshapeRow(ctx, mm, raw));
+      const shape = (raw: unknown) => applyWriteProjection(proj, writtenRow(raw));
       const a = (args ?? {}) as Args;
       const relational = projectsRelations(a);
       const projected = (t: Args) => writeThenRead('create', a, (qi) => qi.create(t));
@@ -3081,7 +3140,7 @@ function makeDelegate(
       ) as unknown as Promise<{ count: number }>,
     update: (args) => {
       let proj: WriteProjection = NO_WRITE_PROJECTION;
-      const shape = (raw: unknown) => applyWriteProjection(proj, reshapeRow(ctx, mm, raw));
+      const shape = (raw: unknown) => applyWriteProjection(proj, writtenRow(raw));
       const relational = projectsRelations(args as Args | undefined);
       const projected = (t: Args) => writeThenRead('update', args as Args, (qi) => qi.update(t));
       return defer(
@@ -3140,7 +3199,7 @@ function makeDelegate(
       ) as unknown as Promise<{ count: number }>,
     delete: (args) => {
       let proj: WriteProjection = NO_WRITE_PROJECTION;
-      const shape = (raw: unknown) => applyWriteProjection(proj, reshapeRow(ctx, mm, raw));
+      const shape = (raw: unknown) => applyWriteProjection(proj, writtenRow(raw));
       const relational = projectsRelations(args as Args | undefined);
       const projected = (t: Args) => writeThenRead('delete', args as Args, (qi) => qi.delete(t));
       return defer(
@@ -3181,7 +3240,7 @@ function makeDelegate(
       ) as unknown as Promise<{ count: number }>,
     upsert: (args) => {
       let proj: WriteProjection = NO_WRITE_PROJECTION;
-      const shape = (raw: unknown) => applyWriteProjection(proj, reshapeRow(ctx, mm, raw));
+      const shape = (raw: unknown) => applyWriteProjection(proj, writtenRow(raw));
       const relational = projectsRelations(args as Args | undefined);
       const projected = (t: Args) => writeThenRead('upsert', args as Args, (qi) => qi.upsert(t));
       return defer(
