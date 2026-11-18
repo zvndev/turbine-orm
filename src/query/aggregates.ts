@@ -11,6 +11,7 @@
 
 import { UnsupportedFeatureError, ValidationError } from '../errors.js';
 import {
+  coerceTemporalValue,
   isTemporalInfinity,
   ownLookup,
   parseDbDate,
@@ -948,8 +949,19 @@ export function buildHavingNumericClauses(
   params: unknown[],
   operandType?: string,
 ): string[] {
-  const bind = (value: unknown): unknown =>
-    operandType === undefined ? value : whereMod.textComparedOperand(qi, operandType, value);
+  // A `_min` / `_max` operand is compared with a stored cell, so it binds as a
+  // where operand against that column does: a Date on a zone-less temporal
+  // column becomes the UTC-component literal (raw, node-postgres would render it
+  // in the PROCESS zone and the comparison would be hours off), and on MySQL a
+  // number against text binds as text.
+  const bind = (value: unknown): unknown => {
+    if (operandType === undefined) return value;
+    const temporal =
+      value instanceof Date
+        ? coerceTemporalValue(operandType, value, whereMod.utcDateTimeRewrite(qi, operandType))
+        : value;
+    return whereMod.textComparedOperand(qi, operandType, temporal);
+  };
   const bindList = (value: unknown): unknown =>
     operandType !== undefined && Array.isArray(value) ? value.map(bind) : value;
   if (filter === null) {
