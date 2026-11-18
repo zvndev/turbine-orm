@@ -4,7 +4,8 @@
  *
  * Each of these used to return a plausible, wrong answer with no error:
  *
- *   - `_count: { select: { posts: { where } } }` counted EVERY post,
+ *   - `_count: { select: { posts: { where } } }` counted EVERY post (it is now
+ *     counted with its filter, by a grouped follow-up count),
  *   - `_count: { selec: ... }` counted every relation, `postz` counted none,
  *   - `include: { posts: { distinct } }` returned duplicates,
  *   - `include: { posts: { wher } }` and `{ limit: 3 }` ignored the option,
@@ -108,7 +109,7 @@ interface Spy {
   warnings: { message: string; code: string | undefined }[];
 }
 
-function spy(schema: SchemaMetadata): Spy {
+function spy(schema: SchemaMetadata, canned: Record<string, Any> = {}): Spy {
   const calls: SpyCall[] = [];
   const txOptions: Any[] = [];
   const warnings: Spy['warnings'] = [];
@@ -119,6 +120,7 @@ function spy(schema: SchemaMetadata): Spy {
         get(_t, prop: string) {
           return (args: Any) => {
             calls.push({ method: `${table}.${prop}`, args });
+            if (Object.hasOwn(canned, `${table}.${prop}`)) return Promise.resolve(canned[`${table}.${prop}`]);
             if (prop.startsWith('build')) return { sql: prop, params: [], tag: prop, transform: (r: Any) => r };
             if (/Many$/.test(prop) || prop === 'groupBy') return Promise.resolve([]);
             return Promise.resolve(null);
@@ -142,9 +144,9 @@ function spy(schema: SchemaMetadata): Spy {
   return { db: db as unknown as CompatTurbineClient, calls, txOptions, warnings };
 }
 
-function client(opts: { withCommentModel?: boolean } = {}): { compat: Any } & Spy {
+function client(opts: { withCommentModel?: boolean; canned?: Record<string, Any> } = {}): { compat: Any } & Spy {
   const { schema, map } = fixture(opts);
-  const s = spy(schema);
+  const s = spy(schema, opts.canned);
   return { ...s, compat: createPrismaCompatClient(s.db as unknown as TurbineClient, map) };
 }
 
@@ -177,33 +179,51 @@ async function refusesE017(run: () => Promise<unknown>, calls: SpyCall[], re: Re
 }
 
 describe('prisma-compat, relation counts', () => {
-  it('a filtered relation count is refused (E017) in select and in include, naming the alternative', async () => {
+  it('a filtered relation count is counted with its filter, not sent to core as a whole count', async () => {
     for (const shape of ['select', 'include'] as const) {
-      const { compat, calls } = client();
-      const args = {
-        where: { id: 1 },
+      const { compat, calls } = client({
+        canned: { 'users.findMany': [{ id: 1 }, { id: 2 }], 'posts.groupBy': [{ userId: 1, _count: 2 }] },
+      });
+      const rows = await compat.User.findMany({
+        where: { id: { in: [1, 2] } },
         [shape]: {
           ...(shape === 'select' ? { id: true } : {}),
           _count: { select: { posts: { where: { published: true } } } },
         },
-      };
-      await refusesE017(
-        () => compat.User.findMany(args),
-        calls,
-        /filtered relation count.*posts.*prisma\.post\.count/s,
+      });
+      assert.equal(lastArgs(calls, 'users.findMany').with, undefined, 'core is not asked for a whole count');
+      assert.deepEqual(lastArgs(calls, 'posts.groupBy'), {
+        by: ['userId'],
+        where: { AND: [{ userId: { in: [1, 2] } }, { isPublished: true }] },
+        _count: true,
+      });
+      assert.deepEqual(
+        rows.map((r: Any) => r._count),
+        [{ posts: 2 }, { posts: 0 }],
       );
     }
   });
 
-  it('the refusal does not depend on the shape of the filter', async () => {
+  it('every filter shape reaches the follow-up count, translated', async () => {
     for (const where of [{ published: true }, { OR: [{ title: 'a' }] }, { NOT: {} }, { AND: [] }]) {
-      const { compat, calls } = client();
-      await refusesE017(
-        () => compat.User.findMany({ include: { _count: { select: { posts: { where } } } } }),
-        calls,
-        /filtered relation count/,
-      );
+      const { compat, calls } = client({ canned: { 'users.findMany': [{ id: 7 }] } });
+      await compat.User.findMany({ include: { _count: { select: { posts: { where } } } } });
+      const filter = lastArgs(calls, 'posts.groupBy').where.AND[1];
+      assert.ok(filter && typeof filter === 'object', JSON.stringify(where));
+      assert.equal(JSON.stringify(filter).includes('published"'), false, 'field names are translated');
     }
+  });
+
+  it('no parent rows means no follow-up count', async () => {
+    const { compat, calls } = client();
+    const rows = await compat.User.findMany({
+      include: { _count: { select: { posts: { where: { published: true } } } } },
+    });
+    assert.deepEqual(rows, []);
+    assert.equal(
+      calls.some((c) => c.method === 'posts.groupBy'),
+      false,
+    );
   });
 
   it('an unfiltered count in every spelling still reaches core as a plain count', async () => {
@@ -275,14 +295,17 @@ describe('prisma-compat, relation counts', () => {
       calls,
       /unknown relation "comentz".*Did you mean "comments"\?/s,
     );
-    const c2 = client();
-    await refusesE017(
-      () =>
-        c2.compat.User.findMany({
-          include: { posts: { include: { _count: { select: { comments: { where: { body: 'x' } } } } } } },
-        }),
-      c2.calls,
-      /filtered relation count.*comments/s,
+    const c2 = client({ canned: { 'users.findMany': [{ id: 1, posts: [{ id: 5 }, { id: 6 }] }] } });
+    const rows = await c2.compat.User.findMany({
+      include: { posts: { include: { _count: { select: { comments: { where: { body: 'x' } } } } } } },
+    });
+    assert.deepEqual(lastArgs(c2.calls, 'users.findMany').with, { posts: {} }, 'no nested _count reaches core');
+    assert.deepEqual(lastArgs(c2.calls, 'comments.groupBy').where, {
+      AND: [{ postId: { in: [5, 6] } }, { body: 'x' }],
+    });
+    assert.deepEqual(
+      rows[0].posts.map((p: Any) => p._count),
+      [{ comments: 0 }, { comments: 0 }],
     );
   });
 });
@@ -364,8 +387,9 @@ describe('prisma-compat, options on an included relation', () => {
     await compat.User.findMany({
       include: { posts: { omit: { published: true }, include: { comments: { take: 1 }, _count: true } } },
     });
+    // The nested `_count` is this layer's follow-up count, so core sees the rest.
     assert.deepEqual(lastArgs(calls, 'users.findMany').with, {
-      posts: { omit: { isPublished: true }, with: { comments: { limit: 1 }, _count: true } },
+      posts: { omit: { isPublished: true }, with: { comments: { limit: 1 } } },
     });
   });
 

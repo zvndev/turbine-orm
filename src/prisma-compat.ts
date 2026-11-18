@@ -72,14 +72,17 @@
  * - **Negative `take`** (take-from-end) throws: Turbine has no reverse-take.
  *   A **`cursor` on a nested relation include** throws: `with` has no cursor
  *   (`take` / `skip` there page each parent's rows, as in Prisma).
- * - **A filtered relation count** (`_count: { select: { posts: { where } } }`)
- *   and **`distinct` on a nested include** throw `UnsupportedFeatureError`:
- *   core counts and includes a relation whole, so honoring either would mean
- *   returning a wrong number or duplicate rows. The message names the
- *   alternative (a `count` / `findMany` on the related model).
+ * - **`distinct` on a nested include** throws `UnsupportedFeatureError`: core
+ *   includes a relation whole, so honoring it would mean returning duplicate
+ *   rows. The message names the alternative (a `findMany` on the related model).
+ *   A filtered relation count (`_count: { select: { posts: { where } } }`) and a
+ *   `_count` below the top level ARE supported: this layer runs one grouped
+ *   count per counted relation after the read, in the same transaction (see
+ *   {@link ReadPlan}). Those two forms count one-to-many relations only; a
+ *   many-to-many one is refused by name.
  * - **Nothing is accepted and dropped.** Every option on an included relation
- *   and every key under `_count` is translated, refused by name (the two
- *   above, `cursor`), or refused as unknown (`ValidationError`, with a
+ *   and every key under `_count` is translated, refused by name (`distinct`,
+ *   `cursor`), or refused as unknown (`ValidationError`, with a
  *   suggestion): a misspelled `wher`, a Turbine spelling like `limit`, a
  *   relation `_count` does not know. The same holds for `$transaction` options
  *   (`maxWait` is accepted, warned about once, and not applied: the pool's
@@ -1080,7 +1083,13 @@ function translateOmit(
  * `RangeError` here, before core's own depth-10 relation cap
  * (`CircularRelationError`) could ever see the `with` clause it was building.
  */
-function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, unknown>, depth = 0): Projection {
+function translateProjection(
+  ctx: Ctx,
+  mm: PrismaModelMap,
+  args: Record<string, unknown>,
+  depth = 0,
+  plan: ReadPlan = newReadPlan(mm, false),
+): Projection {
   assertTranslateDepth(depth, 'include');
   const include = args.include as Record<string, unknown> | undefined;
   const select = args.select as Record<string, unknown> | undefined;
@@ -1094,16 +1103,17 @@ function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, 
         'A `select` already lists exactly the fields you want.',
     );
   }
-  const omit = omitArg ? translateOmit(ctx, mm, omitArg) : undefined;
+  let omit = omitArg ? translateOmit(ctx, mm, omitArg) : undefined;
   const withClause: Record<string, unknown> = {};
   let hasWith = false;
+  /** The `_count` value on this level, decided after the loop (see planCounts). */
+  let countVal: unknown;
 
   if (include) {
     for (const [key, val] of Object.entries(include)) {
       if (val === false || val == null) continue;
       if (key === '_count') {
-        withClause._count = translateCountSelect(ctx, mm, val);
-        hasWith = true;
+        countVal = val;
         continue;
       }
       const rel = ownLookup(mm.relations, key);
@@ -1112,8 +1122,26 @@ function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, 
           `prisma-compat: unknown relation "${key}" in include on model "${modelName(ctx, mm)}".`,
         );
       }
-      setOwn(withClause, rel.name, translateWithOption(ctx, mm, rel.name, val, depth + 1));
+      setOwn(withClause, rel.name, translateWithOption(ctx, mm, rel.name, val, depth + 1, plan));
       hasWith = true;
+    }
+    if (countVal !== undefined) {
+      const core = planCounts(ctx, mm, countVal, plan);
+      if (core !== undefined) {
+        withClause._count = core;
+        hasWith = true;
+      } else if (omit) {
+        // The follow-up count needs each row's key; an `omit` naming it gets it
+        // back for the count and drops it again afterwards.
+        for (const field of countKeyFields(plan)) {
+          if (Object.hasOwn(omit, field)) {
+            delete omit[field];
+            plan.drop ??= new Set();
+            plan.drop.add(prismaFieldName(ctx, mm, field));
+          }
+        }
+        if (Object.keys(omit).length === 0) omit = undefined;
+      }
     }
     return { omit, with: hasWith ? withClause : undefined };
   }
@@ -1121,26 +1149,271 @@ function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, 
   if (select) {
     const scalar: Record<string, boolean> = {};
     let hasScalar = false;
+    const picked = new Set<string>();
     for (const [key, val] of Object.entries(select)) {
       if (val === false || val == null) continue;
       if (key === '_count') {
-        withClause._count = translateCountSelect(ctx, mm, val);
-        hasWith = true;
+        countVal = val;
+        picked.add('_count');
         continue;
       }
       const rel = ownLookup(mm.relations, key);
       if (rel) {
-        setOwn(withClause, rel.name, translateWithOption(ctx, mm, rel.name, val, depth + 1));
+        setOwn(withClause, rel.name, translateWithOption(ctx, mm, rel.name, val, depth + 1, plan));
         hasWith = true;
+        picked.add(key);
         continue;
       }
       setOwn(scalar, renameField(mm, key), true);
       hasScalar = true;
+      picked.add(key);
     }
+    if (countVal !== undefined) {
+      const core = planCounts(ctx, mm, countVal, plan);
+      if (core !== undefined) {
+        withClause._count = core;
+        hasWith = true;
+      }
+    }
+    // A key this layer needs on each row (to attach a follow-up count) is
+    // selected for it and dropped again before the row is returned.
+    let added = false;
+    for (const field of countKeyFields(plan)) {
+      if (!Object.hasOwn(scalar, field)) {
+        setOwn(scalar, field, true);
+        hasScalar = true;
+        added = true;
+      }
+    }
+    // A `select` naming relations or `_count` and no scalar field returns no
+    // scalar in Prisma. Core reads "no scalar select" as every column, so the
+    // smallest projection that keeps the row addressable (its primary key) is
+    // asked for, and trimmed off again.
+    if (!hasScalar && picked.size > 0) {
+      for (const field of primaryKeyFields(ctx, mm)) setOwn(scalar, field, true);
+      hasScalar = Object.keys(scalar).length > 0;
+      added = hasScalar;
+    }
+    if (added) plan.keep = picked;
     return { select: hasScalar ? scalar : undefined, with: hasWith ? withClause : undefined };
   }
 
   return { omit };
+}
+
+// ---------------------------------------------------------------------------
+// Relation counts this layer computes itself (nested, or filtered)
+// ---------------------------------------------------------------------------
+
+/**
+ * What a read needs done to core's rows before they are Prisma's answer, one
+ * node per level of the `include` / `select` tree.
+ *
+ * Core counts a relation whole, and only on the top-level `with` (nested
+ * `_count` is refused on every strategy until all the json emission sites learn
+ * it; see the batched loader). Prisma counts at any depth and takes a `where`
+ * per counted relation. Those counts are computed here instead: one grouped
+ * `COUNT(*)` per counted relation per level, over the keys of the rows that
+ * level returned, on the same connection as the read and inside the same
+ * transaction (one is opened when the read is not already in one), and attached
+ * as `_count` before the rows are reshaped. An unfiltered top-level count still
+ * goes to core unchanged.
+ */
+interface ReadPlan {
+  mm: PrismaModelMap;
+  root: boolean;
+  /** Prisma keys a `select` asked for; set only when this layer added others, which are then dropped. */
+  keep?: Set<string>;
+  /** Prisma keys to drop (an `omit` this layer had to override for a count key). */
+  drop?: Set<string>;
+  /** Counts to compute for each row at this level, in the order the caller named them. */
+  counts: CountRequest[];
+  /** Plans for included relations, by TURBINE relation name. */
+  children: Map<string, ReadPlan>;
+}
+
+interface CountRequest {
+  /** Turbine relation name: the key under `_count` before reshaping. */
+  relation: string;
+  /** The child table the count runs on. */
+  table: string;
+  /** Turbine field on the PARENT row holding the key. */
+  parentField: string;
+  /** Turbine field on the CHILD table pointing at it. */
+  childField: string;
+  /** The caller's filter, translated to the child's turbine field names. */
+  where?: Record<string, unknown>;
+}
+
+function newReadPlan(mm: PrismaModelMap, root: boolean): ReadPlan {
+  return { mm, root, counts: [], children: new Map() };
+}
+
+function planHasCounts(plan: ReadPlan): boolean {
+  if (plan.counts.length > 0) return true;
+  for (const child of plan.children.values()) if (planHasCounts(child)) return true;
+  return false;
+}
+
+function planHasTrim(plan: ReadPlan): boolean {
+  if (plan.keep || plan.drop) return true;
+  for (const child of plan.children.values()) if (planHasTrim(child)) return true;
+  return false;
+}
+
+/** The parent-side key fields this level's follow-up counts read. */
+function countKeyFields(plan: ReadPlan): string[] {
+  return [...new Set(plan.counts.map((c) => c.parentField))];
+}
+
+function primaryKeyFields(ctx: Ctx, mm: PrismaModelMap): string[] {
+  const meta = ownLookup(ctx.schema.tables, mm.table);
+  return (meta?.primaryKey ?? []).map((col) => meta?.reverseColumnMap?.[col] ?? col);
+}
+
+function prismaFieldName(ctx: Ctx, mm: PrismaModelMap, turbineField: string): string {
+  return ownLookup(lookupsFor(ctx, mm).reverseFields, turbineField) ?? turbineField;
+}
+
+/** The one column of a single-column key, or undefined for a composite one. */
+function singleColumn(key: string | string[]): string | undefined {
+  if (!Array.isArray(key)) return key;
+  return key.length === 1 ? key[0] : undefined;
+}
+
+/**
+ * Decide where one level's `_count` is computed. Returns the value for core's
+ * `with._count` when core can answer it (top level, every count unfiltered),
+ * else records the counts on `plan` and returns undefined.
+ */
+function planCounts(ctx: Ctx, mm: PrismaModelMap, val: unknown, plan: ReadPlan): unknown {
+  const parsed = translateCountSelect(ctx, mm, val);
+  const filtered = parsed !== true && parsed.some((c) => c.where !== undefined);
+  if (plan.root && !filtered) {
+    return parsed === true ? true : Object.fromEntries(parsed.map((c) => [c.relation, true]));
+  }
+  const meta = ownLookup(ctx.schema.tables, mm.table);
+  const relations = meta?.relations ?? {};
+  const wanted =
+    parsed === true
+      ? Object.values(relations)
+          .filter((r) => r.type === 'hasMany' || r.type === 'manyToMany')
+          .map((r) => ({ relation: r.name, where: undefined }))
+      : parsed;
+  for (const { relation, where } of wanted) {
+    const rd = ownLookup(relations, relation);
+    const label = `${modelName(ctx, mm)}.${prismaRelationName(ctx, mm, relation)}`;
+    const parentColumn = rd ? singleColumn(rd.referenceKey) : undefined;
+    const childColumn = rd ? singleColumn(rd.foreignKey) : undefined;
+    if (rd?.type !== 'hasMany' || parentColumn === undefined || childColumn === undefined) {
+      throw new UnsupportedFeatureError(
+        `a nested or filtered \`_count\` of "${label}"`,
+        'prisma-compat',
+        rd?.type === 'manyToMany'
+          ? 'Below the top level, and with a `where`, only one-to-many relations are counted. Count the ' +
+              'junction rows with a groupBy on the related model, or use an unfiltered top-level `_count`.'
+          : 'Below the top level, and with a `where`, only one-to-many relations on a single-column key are ' +
+              'counted. Use a groupBy on the related model.',
+      );
+    }
+    const target = ownLookup(ctx.schema.tables, rd.to);
+    const targetModel = relTargetModel(ctx, mm, relation);
+    plan.counts.push({
+      relation,
+      table: rd.to,
+      parentField: meta?.reverseColumnMap?.[parentColumn] ?? parentColumn,
+      childField: target?.reverseColumnMap?.[childColumn] ?? childColumn,
+      ...(where !== undefined
+        ? { where: targetModel ? translateWhere(ctx, targetModel, where) : (where as Record<string, unknown>) }
+        : {}),
+    });
+  }
+  return undefined;
+}
+
+/** A value usable as a Map key that equals for equal key values (a Date by its instant). */
+function countKeyOf(value: unknown): unknown {
+  return value instanceof Date ? `date:${value.getTime()}` : value;
+}
+
+/** Every raw row at one plan level, in result order. */
+function collectPlanRows(
+  rows: readonly unknown[],
+  plan: ReadPlan,
+  into: Map<ReadPlan, Record<string, unknown>[]>,
+): void {
+  const level = into.get(plan) ?? [];
+  into.set(plan, level);
+  for (const row of rows) {
+    if (!isPlainRecord(row)) continue;
+    level.push(row);
+    for (const [rel, child] of plan.children) {
+      const value = row[rel];
+      const next = Array.isArray(value) ? value : value == null ? [] : [value];
+      collectPlanRows(next, child, into);
+    }
+  }
+}
+
+/**
+ * Run every count a {@link ReadPlan} holds and attach it to core's raw rows as
+ * `_count`, keyed by turbine relation name (the reshape renames it).
+ */
+async function attachPlannedCounts(
+  table: (name: string) => CompatQueryInterface,
+  raw: unknown,
+  plan: ReadPlan,
+  passthrough: Record<string, unknown>,
+): Promise<void> {
+  const levels = new Map<ReadPlan, Record<string, unknown>[]>();
+  collectPlanRows(Array.isArray(raw) ? raw : raw == null ? [] : [raw], plan, levels);
+  for (const [level, rows] of levels) {
+    if (level.counts.length === 0) continue;
+    for (const row of rows) row._count = {};
+    for (const req of level.counts) {
+      const ids = [...new Set(rows.map((r) => r[req.parentField]).filter((v) => v !== null && v !== undefined))];
+      const counts = new Map<unknown, number>();
+      if (ids.length > 0) {
+        const byParent = { [req.childField]: { in: ids } };
+        const groups = await table(req.table).groupBy({
+          ...passthrough,
+          by: [req.childField],
+          where: req.where ? { AND: [byParent, req.where] } : byParent,
+          _count: true,
+        });
+        for (const group of groups as Record<string, unknown>[]) {
+          counts.set(countKeyOf(group[req.childField]), Number(group._count));
+        }
+      }
+      for (const row of rows) {
+        (row._count as Record<string, number>)[req.relation] = counts.get(countKeyOf(row[req.parentField])) ?? 0;
+      }
+    }
+  }
+}
+
+/** Drop the keys this layer added (or an `omit` asked for) from reshaped, Prisma-named rows. */
+function trimPlannedRows(ctx: Ctx, rows: unknown, plan: ReadPlan): unknown {
+  const trimRow = (row: unknown, level: ReadPlan): unknown => {
+    if (!isPlainRecord(row)) return row;
+    let out = row;
+    if (level.keep) {
+      out = {};
+      for (const key of level.keep) if (Object.hasOwn(row, key)) setOwn(out, key, row[key]);
+    } else if (level.drop) {
+      out = { ...row };
+      for (const key of level.drop) delete out[key];
+    }
+    for (const [rel, child] of level.children) {
+      const key = prismaRelationName(ctx, level.mm, rel);
+      const value = out[key];
+      if (value === undefined) continue;
+      if (out === row) out = { ...row };
+      out[key] = Array.isArray(value) ? value.map((v) => trimRow(v, child)) : trimRow(value, child);
+    }
+    return out;
+  };
+  return Array.isArray(rows) ? rows.map((r) => trimRow(r, plan)) : trimRow(rows, plan);
 }
 
 /**
@@ -1374,7 +1647,14 @@ function assertNestedRelationKeys(label: string, opts: Record<string, unknown>):
  * one arg with relation hops and then nests the other cannot spend two separate
  * budgets to reach the same stack depth.
  */
-function translateWithOption(ctx: Ctx, mm: PrismaModelMap, turbineRel: string, val: unknown, depth = 0): unknown {
+function translateWithOption(
+  ctx: Ctx,
+  mm: PrismaModelMap,
+  turbineRel: string,
+  val: unknown,
+  depth = 0,
+  parentPlan?: ReadPlan,
+): unknown {
   if (val === true) return true;
   const label = `${modelName(ctx, mm)}.${prismaRelationName(ctx, mm, turbineRel)}`;
   if (!isPlainRecord(val)) {
@@ -1417,7 +1697,9 @@ function translateWithOption(ctx: Ctx, mm: PrismaModelMap, turbineRel: string, v
           '`turbine migrate-from-prisma`, or drop the projection.',
       );
     }
-    const proj = translateProjection(ctx, target, val, depth);
+    const childPlan = newReadPlan(target, false);
+    const proj = translateProjection(ctx, target, val, depth, childPlan);
+    if (parentPlan) parentPlan.children.set(turbineRel, childPlan);
     if (proj.select) opt.select = proj.select;
     // Same silent drop as the top level: a nested `omit` names the sensitive
     // column on the CHILD rows, which are just as exposed.
@@ -1433,16 +1715,18 @@ function isUnfilteredCountWhere(where: unknown): boolean {
 }
 
 /**
- * Translate a Prisma `_count: { select: { rel: true } }` / `true` into Turbine
- * `with._count`.
- *
- * Core counts a relation whole: `with._count` takes `true` or `{ rel: true }`.
- * So a Prisma filtered count (`{ rel: { where } }`) is refused (E017) naming the
- * alternative, a relation that is not on the model is E003, and so is any key
- * but `select` under `_count` (a misspelled `selec` used to count EVERY relation,
- * and a misspelled relation counted nothing, both without a word).
+ * Validate a Prisma `_count` value and read it as the relations it counts:
+ * `true` (every to-many relation) or a list of turbine relation names, each with
+ * the caller's `where` when it filters anything. {@link planCounts} decides who
+ * computes them. A relation that is not on the model is E003, and so is any key
+ * but `select` under `_count` (a misspelled `selec` used to count EVERY
+ * relation, and a misspelled relation counted nothing, both without a word).
  */
-function translateCountSelect(ctx: Ctx, mm: PrismaModelMap, val: unknown): unknown {
+function translateCountSelect(
+  ctx: Ctx,
+  mm: PrismaModelMap,
+  val: unknown,
+): true | { relation: string; where?: unknown }[] {
   if (val === true) return true;
   const model = modelName(ctx, mm);
   if (!isPlainRecord(val)) {
@@ -1467,7 +1751,7 @@ function translateCountSelect(ctx: Ctx, mm: PrismaModelMap, val: unknown): unkno
         `received ${describeValue(val.select)}.`,
     );
   }
-  const out: Record<string, boolean> = {};
+  const out: { relation: string; where?: unknown }[] = [];
   for (const [key, v] of Object.entries(val.select)) {
     if (v === undefined || v === false || v === null) continue;
     const rel = ownLookup(mm.relations, key);
@@ -1481,7 +1765,7 @@ function translateCountSelect(ctx: Ctx, mm: PrismaModelMap, val: unknown): unkno
       );
     }
     if (v === true) {
-      setOwn(out, rel.name, true);
+      out.push({ relation: rel.name });
       continue;
     }
     if (!isPlainRecord(v)) {
@@ -1499,20 +1783,7 @@ function translateCountSelect(ctx: Ctx, mm: PrismaModelMap, val: unknown): unkno
           ' The only key is "where".',
       );
     }
-    if (!isUnfilteredCountWhere(v.where)) {
-      const target = relTargetModel(ctx, mm, rel.name);
-      const targetName = target ? modelName(ctx, target) : undefined;
-      const delegate = targetName ? (prismaPropertyAlias(targetName) ?? targetName) : '<model>';
-      throw new UnsupportedFeatureError(
-        `a filtered relation count (\`_count.select.${key}.where\` on model "${model}")`,
-        'prisma-compat',
-        'Turbine counts every row of a relation, so the filter would be dropped and the number would be wrong. ' +
-          `Count the filtered rows through the related model instead: prisma.${delegate}.count({ where: ... }) ` +
-          `with the foreign key and your filter, or prisma.${delegate}.groupBy({ by: [<foreign key>], _count: true }) ` +
-          'for many parents at once.',
-      );
-    }
-    setOwn(out, rel.name, true);
+    out.push(isUnfilteredCountWhere(v.where) ? { relation: rel.name } : { relation: rel.name, where: v.where });
   }
   return out;
 }
@@ -1560,6 +1831,7 @@ function translateReadArgs(
   mm: PrismaModelMap,
   prismaArgs: Record<string, unknown>,
   kind: ReadKind,
+  plan: ReadPlan = newReadPlan(mm, true),
 ): Record<string, unknown> {
   const t: Record<string, unknown> = {};
   // FIRST, so a per-call `stableRelationOrder` overrides it: the client-level
@@ -1570,7 +1842,7 @@ function translateReadArgs(
   applyNativeOptions(kind === 'unique' ? FIND_UNIQUE_OPTIONS : FIND_MANY_OPTIONS, prismaArgs, t);
   if (prismaArgs.where !== undefined) t.where = translateWhere(ctx, mm, prismaArgs.where);
   if (prismaArgs.orderBy !== undefined) t.orderBy = translateOrderBy(ctx, mm, prismaArgs.orderBy);
-  const proj = translateProjection(ctx, mm, prismaArgs);
+  const proj = translateProjection(ctx, mm, prismaArgs, 0, plan);
   if (proj.select) t.select = proj.select;
   if (proj.omit) t.omit = proj.omit;
   if (proj.with) t.with = proj.with;
@@ -2569,6 +2841,51 @@ function makeDelegate(
     }, batchable);
   };
 
+  /**
+   * One read operation. The {@link ReadPlan} filled by the translation says
+   * whether this layer has counts to run (then the read and its counts share a
+   * transaction, and a `$transaction([...])` array takes its sequential path)
+   * and keys to trim off the reshaped rows.
+   */
+  const readCall = (
+    op: 'findMany' | 'findFirst' | 'findUnique' | 'findFirstOrThrow' | 'findUniqueOrThrow',
+    args: Args | undefined,
+    kind: ReadKind,
+    read: (qi: CompatQueryInterface, t: Args) => Promise<unknown>,
+    build: (qi: CompatQueryInterface, t: Args) => DeferredQuery<unknown>,
+    reshape: (raw: unknown) => unknown,
+  ) => {
+    let plan = newReadPlan(mm, true);
+    const finish = (raw: unknown) => {
+      const shaped = reshape(raw);
+      return planHasTrim(plan) ? trimPlannedRows(ctx, shaped, plan) : shaped;
+    };
+    const withCounts = async (table: (name: string) => CompatQueryInterface, t: Args) => {
+      const raw = await read(table(mm.table), t);
+      const passthrough: Args = {};
+      if (t.skipGlobalFilters !== undefined) passthrough.skipGlobalFilters = t.skipGlobalFilters;
+      if (t.timeout !== undefined) passthrough.timeout = t.timeout;
+      await attachPlannedCounts(table, raw, plan, passthrough);
+      return finish(raw);
+    };
+    return defer(
+      op,
+      args,
+      () => {
+        plan = newReadPlan(mm, true);
+        const a = kind === 'unique' ? requireWhere(args, op) : (args ?? {});
+        return translateReadArgs(ctx, mm, a, kind, plan);
+      },
+      (qi, t) => (planHasCounts(plan) ? runInTx((table) => withCounts(table, t)) : read(qi, t).then(finish)),
+      {
+        build,
+        reshape: finish,
+        nested: () => planHasCounts(plan),
+        execInTx: (table, t) => (planHasCounts(plan) ? withCounts(table, t) : read(table(mm.table), t).then(finish)),
+      },
+    );
+  };
+
   const requireWhere = (args: Args | undefined, op: string): Args => {
     if (!args || args.where === undefined) {
       throw new ValidationError(`prisma-compat: ${op} on "${modelName(ctx, mm)}" requires a \`where\`.`);
@@ -2578,44 +2895,49 @@ function makeDelegate(
 
   return {
     findMany: (args = {}) =>
-      defer(
+      readCall(
         'findMany',
         args,
-        () => translateReadArgs(ctx, mm, args, 'many'),
-        (qi, t) => qi.findMany(t).then((r) => reshapeRows(ctx, mm, r)),
-        { build: (qi, t) => qi.buildFindMany(t), reshape: (raw) => reshapeRows(ctx, mm, raw) },
+        'many',
+        (qi, t) => qi.findMany(t),
+        (qi, t) => qi.buildFindMany(t),
+        (raw) => reshapeRows(ctx, mm, raw),
       ) as unknown as Promise<PrismaModelTypes['Row'][]>,
     findFirst: (args = {}) =>
-      defer(
+      readCall(
         'findFirst',
         args,
-        () => translateReadArgs(ctx, mm, args, 'first'),
-        (qi, t) => qi.findFirst(t).then((r) => reshapeRowOrNull(ctx, mm, r)),
-        { build: (qi, t) => qi.buildFindFirst(t), reshape: (raw) => reshapeRowOrNull(ctx, mm, raw) },
+        'first',
+        (qi, t) => qi.findFirst(t),
+        (qi, t) => qi.buildFindFirst(t),
+        (raw) => reshapeRowOrNull(ctx, mm, raw),
       ) as unknown as Promise<PrismaModelTypes['Row'] | null>,
     findUnique: (args) =>
-      defer(
+      readCall(
         'findUnique',
         args,
-        () => translateReadArgs(ctx, mm, requireWhere(args, 'findUnique'), 'unique'),
-        (qi, t) => qi.findUnique(t).then((r) => reshapeRowOrNull(ctx, mm, r)),
-        { build: (qi, t) => qi.buildFindUnique(t), reshape: (raw) => reshapeRowOrNull(ctx, mm, raw) },
+        'unique',
+        (qi, t) => qi.findUnique(t),
+        (qi, t) => qi.buildFindUnique(t),
+        (raw) => reshapeRowOrNull(ctx, mm, raw),
       ) as unknown as Promise<PrismaModelTypes['Row'] | null>,
     findFirstOrThrow: (args = {}) =>
-      defer(
+      readCall(
         'findFirstOrThrow',
         args,
-        () => translateReadArgs(ctx, mm, args, 'first'),
-        (qi, t) => qi.findFirstOrThrow(t).then((r) => reshapeRow(ctx, mm, r)),
-        { build: (qi, t) => qi.buildFindFirstOrThrow(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
+        'first',
+        (qi, t) => qi.findFirstOrThrow(t),
+        (qi, t) => qi.buildFindFirstOrThrow(t),
+        (raw) => reshapeRow(ctx, mm, raw),
       ) as unknown as Promise<PrismaModelTypes['Row']>,
     findUniqueOrThrow: (args) =>
-      defer(
+      readCall(
         'findUniqueOrThrow',
         args,
-        () => translateReadArgs(ctx, mm, requireWhere(args, 'findUniqueOrThrow'), 'unique'),
-        (qi, t) => qi.findUniqueOrThrow(t).then((r) => reshapeRow(ctx, mm, r)),
-        { build: (qi, t) => qi.buildFindUniqueOrThrow(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
+        'unique',
+        (qi, t) => qi.findUniqueOrThrow(t),
+        (qi, t) => qi.buildFindUniqueOrThrow(t),
+        (raw) => reshapeRow(ctx, mm, raw),
       ) as unknown as Promise<PrismaModelTypes['Row']>,
     create: (args) => {
       // Resolved inside the translate thunk below (so it validates before the
