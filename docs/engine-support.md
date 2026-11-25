@@ -3,7 +3,7 @@
 
 # Engine and version support
 
-As of 2026-11-16. It describes release 0.95.0 and the test evidence wired into its release gates.
+As of 2026-11-25. It describes release 0.96.0 and the test evidence wired into its release gates.
 
 This page says, for every engine and transport the package exposes, what works, on which versions, and how
 that is known. Each claim names its evidence, and each tier is computed from that evidence by the rule
