@@ -1,6 +1,6 @@
 {
-  "asOf": "2026-11-16",
-  "source": "It describes release 0.95.0 and the test evidence wired into its release gates.",
+  "asOf": "2026-11-25",
+  "source": "It describes release 0.96.0 and the test evidence wired into its release gates.",
   "features": [
     { "id": "typed-queries", "label": "Typed queries", "core": true },
     { "id": "nested-relations", "label": "Nested relation reads", "core": true },

@@ -1,5 +1,96 @@
 # Changelog
 
+## 0.96.0 (2026-11-25)
+
+Closes twelve gaps between `turbine-orm/prisma-compat` and Prisma, found by
+running a large Prisma app (about 165 models, heavy raw SQL and interactive
+transactions) on the compat layer. On that app the compat layer went from
+failing 22 of 43 Postgres proofs to passing all 44. The core client also
+honours Prisma's `schema`, `connection_limit` and `pool_timeout` connection
+string parameters, which node-postgres ignored without a word. Root
+`dependencies` is still exactly `{ "pg": "^8.15.0" }`.
+
+### Behaviour changes
+
+- **Prisma's connection string parameters are honoured.** The client reads
+  `schema`, `connection_limit` and `pool_timeout` from its connection string.
+  This changes Stable client configuration under the correctness exception:
+  before, a `DATABASE_URL` carried over from Prisma
+  with `?schema=tenant_a` ran every query against `public`. The parameters
+  are read from an explicit `connectionString` or the `DATABASE_URL`
+  fallback and stripped before pg sees the string. A connection string with
+  none of the three passes through untouched.
+  - `schema`, when not `public`, becomes the connection's `search_path`
+    through the startup `options` parameter, never a `SET`. A name with
+    whitespace, a double quote or a backslash, and a schema on what looks
+    like a transaction pooler, are refused with `TURBINE_E003` when the
+    client is created.
+  - `connection_limit` sets the pool size, so `connection_limit=1` now
+    really gives a pool of one. `pool_timeout` sets the checkout timeout in
+    seconds, with 0 meaning wait forever. An explicit `poolSize` or
+    `connectionTimeoutMs` still wins, and an invalid value is `TURBINE_E003`
+    naming the parameter, never the URL.
+- **prisma-compat `$disconnect()` closes the pool for good.** It used to be a
+  no-op, so a script ending in it never exited. Unlike Prisma, a later query
+  does not reopen the pool. `$connect()` now runs one `SELECT 1`.
+- **prisma-compat write results drop relation keys unless `include` asked
+  for them.** Prisma returns only the written row's scalars; the compat layer
+  used to pass on the relations core reads back after a nested write.
+- **prisma-compat `select` naming only relations and `_count` returns only
+  those keys.** It used to return every scalar column as well.
+- **prisma-compat `groupBy` rows carry `_count` only when the call asks for
+  it.** The count still runs, so `orderBy: { _count }` keeps working.
+- **prisma-compat `$queryRaw` and `$executeRaw` refuse a first argument that
+  is neither a template nor a fragment.** A plain string or an unknown object
+  used to flatten into an empty or character-split statement.
+- **`turbine migrate-from-prisma` emits `now` for every `@default(now())`
+  field.** Prisma stamps these with the application's clock even when the
+  column also has a database default. Re-run it to regenerate the map.
+
+### Added
+
+- `prismaNamespace` option on the compat client. Fragments built with another
+  library's `Prisma.sql`, `Prisma.join`, `Prisma.raw` and `Prisma.empty`
+  compose like the compat layer's own. They are recognized by prototype, never
+  by shape, so a request body with `strings` and `values` keys is still a
+  bound value.
+- `turbineOf(client)` and `bindTransaction(client, coreTx)`, so compat and
+  core code can share one transaction while a codebase moves off the compat
+  surface module by module.
+- `_count` at any depth of a `select` or `include` tree, and with a `where`
+  per counted relation. The compat layer runs one grouped count per relation
+  per level, in the read's transaction. A many-to-many or composite-key
+  relation in these forms is refused by name.
+- `include` and relation `select` on `create`, `update`, `upsert` and
+  `delete`. The write and a read-back by primary key run in one transaction;
+  a delete reads first.
+- Nested writes: Prisma's client-side defaults on every nested row, nested
+  `createMany` on one-to-many relations, and to-one nested `upsert` and
+  `update` without `where`.
+
+### Fixed
+
+- prisma-compat `$queryRaw` and `$executeRaw` with a lone `Prisma.sql`
+  fragment sent an empty statement and resolved to `[]` or 0.
+- A `Date` in a `groupBy` `having` compared hours off in any process not
+  running in UTC. It now binds the way the same `Date` does in `where`.
+- Concurrent statements on one transaction, such as
+  `Promise.all([tx.a(), tx.b()])` or batched relation loads, were handed to
+  node-postgres at once, which queues them in a way it reports as deprecated
+  and pg 9 removes. The transaction now sends them one at a time in call
+  order, and refuses one queued behind a statement that ended the
+  transaction. Drivers that declare `supportsPipelining`, and savepoint
+  control statements, keep their old path.
+
+### Upgrading
+
+- A Prisma-style `?schema=` on a pooler host now fails when the client is
+  created. Point it at a direct endpoint, or drop the parameter if `public`
+  was what actually ran.
+- Code that calls `$disconnect()` on the compat client and then queries again
+  needs a new client.
+- Re-run `turbine migrate-from-prisma` to pick up client-side `now` defaults.
+
 ## 0.95.0 (2026-11-16)
 
 One relation derivation for every engine. PostgreSQL, SQLite (`node:sqlite`
