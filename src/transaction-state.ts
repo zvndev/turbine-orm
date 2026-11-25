@@ -570,7 +570,9 @@ export class TransactionState {
       }
       this.assertNotAborted();
       const name = `sp_${++this.savepointCount}`;
-      await this.control(this.dialect.savepointStatement(name));
+      // In order: a statement issued before this block and still queued
+      // behind one on the wire belongs outside the savepoint.
+      await this.control(this.dialect.savepointStatement(name), true);
       const opened: TransactionScope = {
         state: this,
         parent,
@@ -667,13 +669,25 @@ export class TransactionState {
    * Typed INSIDE the statement, so the failure the state records is the Turbine
    * error and not the driver's.
    */
-  private async control(sql: string): Promise<void> {
+  private async control(sql: string, inOrder = false): Promise<void> {
     this.assertOpen();
     this.assertAvailable();
-    // Not ordered behind statements still on the wire: a ROLLBACK TO after a
-    // statement cut short by its deadline is how that statement's outcome is
-    // settled, and it must not wait for the statement to end.
-    await this.send(() => sendControl(this.client, sql), undefined, false);
+    // RELEASE and ROLLBACK TO are not ordered behind statements still on the
+    // wire: a ROLLBACK TO after a statement cut short by its deadline is how
+    // that statement's outcome is settled, and it must not wait for the
+    // statement to end. A SAVEPOINT is (`inOrder`): sent past a statement
+    // queued before it, it would open the block around that statement, and
+    // the block's rollback would undo a statement that reported success.
+    await this.send(
+      () => sendControl(this.client, sql),
+      inOrder
+        ? () => {
+            this.assertOpen();
+            this.assertNotAborted();
+          }
+        : undefined,
+      inOrder,
+    );
   }
 }
 

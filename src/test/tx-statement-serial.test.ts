@@ -117,4 +117,36 @@ describe('statements on one transaction connection', () => {
     assert.equal(fake.sent.includes('SELECT after'), false, 'the queued statement never reached the server');
     await db.disconnect();
   });
+
+  it('a statement queued before a savepoint block is sent before its SAVEPOINT, so the block cannot undo it', async () => {
+    // `SELECT 2` is issued before the block, so it belongs outside it. It is
+    // still waiting for `SELECT 1` when the block opens; a SAVEPOINT sent past
+    // it would put it inside the block, and the block's rollback would undo a
+    // statement that had already reported success.
+    const fake = fakeServer();
+    const db = new TurbineClient({ pool: fake.pool, preparedStatements: false } as never, schema);
+    await db.$transaction(async (tx) => {
+      const results = await Promise.allSettled([
+        tx.rawUnsafe('SELECT 1'),
+        tx.rawUnsafe('SELECT 2'),
+        tx.$transaction(async (inner) => {
+          await inner.rawUnsafe('SELECT 3');
+          throw new Error('roll back this block only');
+        }),
+      ]);
+      assert.deepEqual(
+        results.map((r) => r.status),
+        ['fulfilled', 'fulfilled', 'rejected'],
+      );
+    });
+    const body = fake.sent.filter((sql) => !/^(BEGIN|COMMIT)/i.test(sql.trim()));
+    assert.ok(body.length >= 5, body.join(' | '));
+    assert.equal(body[0], 'SELECT 1');
+    assert.equal(body[1], 'SELECT 2', `sent before the block's SAVEPOINT: ${body.join(' | ')}`);
+    assert.match(body[2] ?? '', /^SAVEPOINT/i);
+    assert.equal(body[3], 'SELECT 3');
+    assert.match(body[4] ?? '', /^ROLLBACK TO/i);
+    assert.equal(fake.maxInFlight, 1, 'the connection never held two statements');
+    await db.disconnect();
+  });
 });
