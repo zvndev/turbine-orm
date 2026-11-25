@@ -1813,8 +1813,16 @@ src/
                       A `client` member shadowing a delegate or CLIENT_RESERVED_KEYS, or a
                       `model` key naming no model, throws E003. `Prisma.getExtensionContext`
                       is the identity function; `$name` is runtime-only, not on the type.
-                      Nothing is accepted and dropped (0.90): a filtered `_count` and a nested
-                      `distinct` / `cursor` are E017; an unknown nested option (Turbine's
+                      Nothing is accepted and dropped (0.90): a nested `distinct` / `cursor`
+                      is E017. A filtered `_count` and a `_count` below the top level are
+                      computed HERE, not in core: the read's translation fills a
+                      `ReadPlan` tree, and the read then runs one grouped count per counted
+                      one-to-many relation per level over that level's row keys, on the
+                      read's connection and in one transaction with it (opened if needed;
+                      a `$transaction([...])` array takes its sequential path), attaching
+                      `_count` before reshaping. Keys it had to add to a `select` are
+                      trimmed afterwards. An unfiltered top-level `_count` still goes to core
+                      in the same statement. An unknown nested option (Turbine's
                       `limit` / `offset` / `with` included), an unknown `_count` key, an
                       unknown `$transaction` option, an unread nested-write key, and a
                       projection on a relation outside the map are E003. The array-form

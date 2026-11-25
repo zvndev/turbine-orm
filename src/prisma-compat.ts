@@ -63,21 +63,26 @@
  * - `instanceof PrismaClientKnownRequestError`, `.meta`/message byte parity
  *   (opt into `prismaErrorCodes` for a `.code` like `P2002`, without pretending
  *   `instanceof` identity).
- * - `Prisma.join` / `Prisma.raw` composition beyond plain fragment flattening.
+ * - Splicing another library's `Prisma.sql` fragments unless asked to: they are
+ *   bound as values until the client is given that library's namespace
+ *   ({@link PrismaCompatOptions.prismaNamespace}).
  * - Fluent relation chaining (`prisma.user.findUnique().posts()`).
  * - Accelerate / Pulse / driver-adapter preview features, the Mongo API, and the
  *   `prisma migrate`/`db` CLI family (Turbine ships its own migrations).
  * - **Negative `take`** (take-from-end) throws: Turbine has no reverse-take.
  *   A **`cursor` on a nested relation include** throws: `with` has no cursor
  *   (`take` / `skip` there page each parent's rows, as in Prisma).
- * - **A filtered relation count** (`_count: { select: { posts: { where } } }`)
- *   and **`distinct` on a nested include** throw `UnsupportedFeatureError`:
- *   core counts and includes a relation whole, so honoring either would mean
- *   returning a wrong number or duplicate rows. The message names the
- *   alternative (a `count` / `findMany` on the related model).
+ * - **`distinct` on a nested include** throws `UnsupportedFeatureError`: core
+ *   includes a relation whole, so honoring it would mean returning duplicate
+ *   rows. The message names the alternative (a `findMany` on the related model).
+ *   A filtered relation count (`_count: { select: { posts: { where } } }`) and a
+ *   `_count` below the top level ARE supported: this layer runs one grouped
+ *   count per counted relation after the read, in the same transaction (see
+ *   {@link ReadPlan}). Those two forms count one-to-many relations only; a
+ *   many-to-many one is refused by name.
  * - **Nothing is accepted and dropped.** Every option on an included relation
- *   and every key under `_count` is translated, refused by name (the two
- *   above, `cursor`), or refused as unknown (`ValidationError`, with a
+ *   and every key under `_count` is translated, refused by name (`distinct`,
+ *   `cursor`), or refused as unknown (`ValidationError`, with a
  *   suggestion): a misspelled `wher`, a Turbine spelling like `limit`, a
  *   relation `_count` does not know. The same holds for `$transaction` options
  *   (`maxWait` is accepted, warned about once, and not applied: the pool's
@@ -89,10 +94,11 @@
  * - **Write projections**: `select` / `omit` on create/update/delete/upsert
  *   narrow the RETURNED OBJECT (see {@link resolveWriteProjection}); they do
  *   NOT narrow the statement's `RETURNING` list, so the column still crosses
- *   the wire, and `pii: true` remains the SQL-level control. A relation key in
- *   either (or any `include` on a write) THROWS, since a write returns its own
- *   row only. `omit` on READS is translated to core's own `omit`, see
- *   {@link translateOmit}.
+ *   the wire, and `pii: true` remains the SQL-level control. A write whose
+ *   `include` / `select` names a relation or `_count` runs as the write followed
+ *   by a read of the written row by primary key, in one transaction (a delete
+ *   reads first), so it returns what Prisma returns. `omit` on READS is
+ *   translated to core's own `omit`, see {@link translateOmit}.
  * - **`take` / `skip` / `cursor` on `count` and `aggregate`** throw: Prisma
  *   computes those over one page of rows and Turbine has no paged count. An
  *   `orderBy` alone changes nothing there and is accepted. `count({ select })`
@@ -130,7 +136,7 @@
 // Type-only import: erased at runtime, so it introduces NO runtime cycle (core
 // never imports this subpath). It lets the public factory accept the real
 // `TurbineClient` for first-class consumer DX.
-import type { TurbineClient } from './client.js';
+import type { TransactionClient, TurbineClient } from './client.js';
 import { resolveDiagnostics } from './diagnostics.js';
 import { TurbineError, TurbineErrorCode, UnsupportedFeatureError, ValidationError, wrapPgError } from './errors.js';
 import { CLIENT_LOG_CONTEXT, type ClientLogContext, consoleLogger, logTo } from './logger.js';
@@ -225,6 +231,10 @@ export interface CompatTransactionClient {
 /** The minimal `TurbineClient` surface the adapter consumes. */
 export interface CompatTurbineClient extends CompatTransactionClient {
   readonly schema: SchemaMetadata;
+  /** Core `connect()`; absent on a test stub. */
+  connect?(): Promise<void>;
+  /** Core `disconnect()`; absent on a test stub. */
+  disconnect?(): Promise<unknown>;
   $transaction<R>(fn: (tx: CompatTransactionClient) => Promise<R>, options?: unknown): Promise<R>;
   $transaction(queries: readonly DeferredQuery<unknown>[], options?: unknown): Promise<unknown[]>;
 }
@@ -265,6 +275,73 @@ function isSqlFragment(x: unknown): x is Sql {
 
 function makeSql(strings: readonly string[], values: readonly unknown[]): Sql {
   return { strings, values, [SQL_FRAGMENT]: true };
+}
+
+/** The structural shape of a fragment: this module's {@link Sql}, or another library's. */
+export interface SqlFragmentLike {
+  readonly strings: readonly string[];
+  readonly values: readonly unknown[];
+}
+
+/**
+ * Answers whether a raw-SQL argument is a fragment to splice, and if so its
+ * parts. Anything it does not recognize is a VALUE and is bound as `$N`.
+ */
+type FragmentReader = (value: unknown) => SqlFragmentLike | undefined;
+
+/** The default reader: this module's own branded fragments only. */
+const ownFragment: FragmentReader = (value) => (isSqlFragment(value) ? value : undefined);
+
+/**
+ * A reader that also splices fragments built by another library's `Prisma`
+ * namespace (in practice `@prisma/client`, whose `Prisma.sql` / `join` / `raw` /
+ * `empty` all return instances of one class that is not exported).
+ *
+ * Recognition is by PROTOTYPE IDENTITY with the namespace's own `empty`
+ * fragment, never by shape. A shape test (`strings` + `values` arrays) would
+ * splice a request body: `JSON.parse` happily produces
+ * `{ "strings": ["1; DROP TABLE t; --"], "values": [] }`, and that object sitting
+ * in `$queryRaw\`... ${body.filter}\`` would then be SQL rather than a bound
+ * value. A parsed body can never carry a class prototype, so it stays a value,
+ * exactly as it does in Prisma, which recognizes its fragments by `instanceof`.
+ */
+function foreignFragmentReader(namespace: PrismaNamespaceLike): FragmentReader {
+  const empty = (namespace as { empty?: unknown } | null | undefined)?.empty;
+  const proto = typeof empty === 'object' && empty !== null ? Object.getPrototypeOf(empty) : null;
+  if (proto === null || proto === Object.prototype || !hasFragmentParts(empty)) {
+    throw new ValidationError(
+      'prisma-compat: `prismaNamespace` takes the `Prisma` namespace of a client library ' +
+        '(`import { Prisma } from "@prisma/client"`), whose `Prisma.empty` is a fragment instance with ' +
+        '`strings` and `values` arrays. The value given has no such `empty`.',
+    );
+  }
+  return (value) => {
+    if (isSqlFragment(value)) return value;
+    if (typeof value !== 'object' || value === null || Object.getPrototypeOf(value) !== proto) return undefined;
+    if (!hasFragmentParts(value)) {
+      throw new ValidationError(
+        'prisma-compat: a fragment from the configured `prismaNamespace` does not have `strings` and `values` ' +
+          'arrays with one more string than values, so it cannot be composed.',
+      );
+    }
+    return value;
+  };
+}
+
+function hasFragmentParts(value: unknown): value is SqlFragmentLike {
+  const { strings, values } = value as { strings?: unknown; values?: unknown };
+  return (
+    Array.isArray(strings) &&
+    Array.isArray(values) &&
+    strings.length === values.length + 1 &&
+    strings.every((part) => typeof part === 'string')
+  );
+}
+
+/** The part of a client library's `Prisma` namespace {@link PrismaCompatOptions.prismaNamespace} reads. */
+export interface PrismaNamespaceLike {
+  /** `Prisma.empty`: an instance of the library's fragment class. */
+  readonly empty: object;
 }
 
 /**
@@ -343,6 +420,27 @@ export interface PrismaCompatOptions {
    * `false` (Turbine's own `TURBINE_E0NN` codes are preserved untouched).
    */
   prismaErrorCodes?: boolean;
+  /**
+   * The `Prisma` namespace of the client library the call sites were written
+   * against (`import { Prisma } from '@prisma/client'`). With it, fragments that
+   * library builds (`Prisma.sql`, `Prisma.join`, `Prisma.raw`, `Prisma.empty`)
+   * compose in `$queryRaw` / `$executeRaw` exactly like this module's own: nested
+   * in a template, as the lone argument, and inside each other. Without it they
+   * are bound as `$N` values, which is the safe reading of an object nobody vouched
+   * for.
+   *
+   * Only instances of the namespace's own fragment class are spliced (recognized
+   * by prototype, never by shape), so an object parsed from a request body is a
+   * value whatever keys it carries.
+   *
+   * @example
+   * ```ts
+   * import { Prisma } from '@prisma/client';
+   * const prisma = createPrismaCompatClient(db, PRISMA_MAP, { prismaNamespace: Prisma });
+   * await prisma.$queryRaw`SELECT * FROM "User" WHERE id IN (${Prisma.join(ids)})`;
+   * ```
+   */
+  prismaNamespace?: PrismaNamespaceLike;
 }
 
 /** Turbine error code → nearest Prisma `PXXXX` code. */
@@ -391,7 +489,9 @@ interface Ctx {
   /** turbine table name → prisma model name. */
   tableToModel: Map<string, string>;
   lookups: Map<string, ModelLookups>;
-  options: Required<PrismaCompatOptions>;
+  options: Required<Pick<PrismaCompatOptions, 'stablePkOrder' | 'prismaErrorCodes'>>;
+  /** Which raw-SQL arguments are fragments (see {@link PrismaCompatOptions.prismaNamespace}). */
+  fragmentOf: FragmentReader;
 }
 
 const TIME_PG_TYPES = new Set(['time', 'time without time zone', 'timetz', 'time with time zone']);
@@ -988,7 +1088,13 @@ function translateOmit(
  * `RangeError` here, before core's own depth-10 relation cap
  * (`CircularRelationError`) could ever see the `with` clause it was building.
  */
-function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, unknown>, depth = 0): Projection {
+function translateProjection(
+  ctx: Ctx,
+  mm: PrismaModelMap,
+  args: Record<string, unknown>,
+  depth = 0,
+  plan: ReadPlan = newReadPlan(mm, false),
+): Projection {
   assertTranslateDepth(depth, 'include');
   const include = args.include as Record<string, unknown> | undefined;
   const select = args.select as Record<string, unknown> | undefined;
@@ -1002,16 +1108,17 @@ function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, 
         'A `select` already lists exactly the fields you want.',
     );
   }
-  const omit = omitArg ? translateOmit(ctx, mm, omitArg) : undefined;
+  let omit = omitArg ? translateOmit(ctx, mm, omitArg) : undefined;
   const withClause: Record<string, unknown> = {};
   let hasWith = false;
+  /** The `_count` value on this level, decided after the loop (see planCounts). */
+  let countVal: unknown;
 
   if (include) {
     for (const [key, val] of Object.entries(include)) {
       if (val === false || val == null) continue;
       if (key === '_count') {
-        withClause._count = translateCountSelect(ctx, mm, val);
-        hasWith = true;
+        countVal = val;
         continue;
       }
       const rel = ownLookup(mm.relations, key);
@@ -1020,8 +1127,26 @@ function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, 
           `prisma-compat: unknown relation "${key}" in include on model "${modelName(ctx, mm)}".`,
         );
       }
-      setOwn(withClause, rel.name, translateWithOption(ctx, mm, rel.name, val, depth + 1));
+      setOwn(withClause, rel.name, translateWithOption(ctx, mm, rel.name, val, depth + 1, plan));
       hasWith = true;
+    }
+    if (countVal !== undefined) {
+      const core = planCounts(ctx, mm, countVal, plan);
+      if (core !== undefined) {
+        withClause._count = core;
+        hasWith = true;
+      } else if (omit) {
+        // The follow-up count needs each row's key; an `omit` naming it gets it
+        // back for the count and drops it again afterwards.
+        for (const field of countKeyFields(plan)) {
+          if (Object.hasOwn(omit, field)) {
+            delete omit[field];
+            plan.drop ??= new Set();
+            plan.drop.add(prismaFieldName(ctx, mm, field));
+          }
+        }
+        if (Object.keys(omit).length === 0) omit = undefined;
+      }
     }
     return { omit, with: hasWith ? withClause : undefined };
   }
@@ -1029,26 +1154,271 @@ function translateProjection(ctx: Ctx, mm: PrismaModelMap, args: Record<string, 
   if (select) {
     const scalar: Record<string, boolean> = {};
     let hasScalar = false;
+    const picked = new Set<string>();
     for (const [key, val] of Object.entries(select)) {
       if (val === false || val == null) continue;
       if (key === '_count') {
-        withClause._count = translateCountSelect(ctx, mm, val);
-        hasWith = true;
+        countVal = val;
+        picked.add('_count');
         continue;
       }
       const rel = ownLookup(mm.relations, key);
       if (rel) {
-        setOwn(withClause, rel.name, translateWithOption(ctx, mm, rel.name, val, depth + 1));
+        setOwn(withClause, rel.name, translateWithOption(ctx, mm, rel.name, val, depth + 1, plan));
         hasWith = true;
+        picked.add(key);
         continue;
       }
       setOwn(scalar, renameField(mm, key), true);
       hasScalar = true;
+      picked.add(key);
     }
+    if (countVal !== undefined) {
+      const core = planCounts(ctx, mm, countVal, plan);
+      if (core !== undefined) {
+        withClause._count = core;
+        hasWith = true;
+      }
+    }
+    // A key this layer needs on each row (to attach a follow-up count) is
+    // selected for it and dropped again before the row is returned.
+    let added = false;
+    for (const field of countKeyFields(plan)) {
+      if (!Object.hasOwn(scalar, field)) {
+        setOwn(scalar, field, true);
+        hasScalar = true;
+        added = true;
+      }
+    }
+    // A `select` naming relations or `_count` and no scalar field returns no
+    // scalar in Prisma. Core reads "no scalar select" as every column, so the
+    // smallest projection that keeps the row addressable (its primary key) is
+    // asked for, and trimmed off again.
+    if (!hasScalar && picked.size > 0) {
+      for (const field of primaryKeyFields(ctx, mm)) setOwn(scalar, field, true);
+      hasScalar = Object.keys(scalar).length > 0;
+      added = hasScalar;
+    }
+    if (added) plan.keep = picked;
     return { select: hasScalar ? scalar : undefined, with: hasWith ? withClause : undefined };
   }
 
   return { omit };
+}
+
+// ---------------------------------------------------------------------------
+// Relation counts this layer computes itself (nested, or filtered)
+// ---------------------------------------------------------------------------
+
+/**
+ * What a read needs done to core's rows before they are Prisma's answer, one
+ * node per level of the `include` / `select` tree.
+ *
+ * Core counts a relation whole, and only on the top-level `with` (nested
+ * `_count` is refused on every strategy until all the json emission sites learn
+ * it; see the batched loader). Prisma counts at any depth and takes a `where`
+ * per counted relation. Those counts are computed here instead: one grouped
+ * `COUNT(*)` per counted relation per level, over the keys of the rows that
+ * level returned, on the same connection as the read and inside the same
+ * transaction (one is opened when the read is not already in one), and attached
+ * as `_count` before the rows are reshaped. An unfiltered top-level count still
+ * goes to core unchanged.
+ */
+interface ReadPlan {
+  mm: PrismaModelMap;
+  root: boolean;
+  /** Prisma keys a `select` asked for; set only when this layer added others, which are then dropped. */
+  keep?: Set<string>;
+  /** Prisma keys to drop (an `omit` this layer had to override for a count key). */
+  drop?: Set<string>;
+  /** Counts to compute for each row at this level, in the order the caller named them. */
+  counts: CountRequest[];
+  /** Plans for included relations, by TURBINE relation name. */
+  children: Map<string, ReadPlan>;
+}
+
+interface CountRequest {
+  /** Turbine relation name: the key under `_count` before reshaping. */
+  relation: string;
+  /** The child table the count runs on. */
+  table: string;
+  /** Turbine field on the PARENT row holding the key. */
+  parentField: string;
+  /** Turbine field on the CHILD table pointing at it. */
+  childField: string;
+  /** The caller's filter, translated to the child's turbine field names. */
+  where?: Record<string, unknown>;
+}
+
+function newReadPlan(mm: PrismaModelMap, root: boolean): ReadPlan {
+  return { mm, root, counts: [], children: new Map() };
+}
+
+function planHasCounts(plan: ReadPlan): boolean {
+  if (plan.counts.length > 0) return true;
+  for (const child of plan.children.values()) if (planHasCounts(child)) return true;
+  return false;
+}
+
+function planHasTrim(plan: ReadPlan): boolean {
+  if (plan.keep || plan.drop) return true;
+  for (const child of plan.children.values()) if (planHasTrim(child)) return true;
+  return false;
+}
+
+/** The parent-side key fields this level's follow-up counts read. */
+function countKeyFields(plan: ReadPlan): string[] {
+  return [...new Set(plan.counts.map((c) => c.parentField))];
+}
+
+function primaryKeyFields(ctx: Ctx, mm: PrismaModelMap): string[] {
+  const meta = ownLookup(ctx.schema.tables, mm.table);
+  return (meta?.primaryKey ?? []).map((col) => meta?.reverseColumnMap?.[col] ?? col);
+}
+
+function prismaFieldName(ctx: Ctx, mm: PrismaModelMap, turbineField: string): string {
+  return ownLookup(lookupsFor(ctx, mm).reverseFields, turbineField) ?? turbineField;
+}
+
+/** The one column of a single-column key, or undefined for a composite one. */
+function singleColumn(key: string | string[]): string | undefined {
+  if (!Array.isArray(key)) return key;
+  return key.length === 1 ? key[0] : undefined;
+}
+
+/**
+ * Decide where one level's `_count` is computed. Returns the value for core's
+ * `with._count` when core can answer it (top level, every count unfiltered),
+ * else records the counts on `plan` and returns undefined.
+ */
+function planCounts(ctx: Ctx, mm: PrismaModelMap, val: unknown, plan: ReadPlan): unknown {
+  const parsed = translateCountSelect(ctx, mm, val);
+  const filtered = parsed !== true && parsed.some((c) => c.where !== undefined);
+  if (plan.root && !filtered) {
+    return parsed === true ? true : Object.fromEntries(parsed.map((c) => [c.relation, true]));
+  }
+  const meta = ownLookup(ctx.schema.tables, mm.table);
+  const relations = meta?.relations ?? {};
+  const wanted =
+    parsed === true
+      ? Object.values(relations)
+          .filter((r) => r.type === 'hasMany' || r.type === 'manyToMany')
+          .map((r) => ({ relation: r.name, where: undefined }))
+      : parsed;
+  for (const { relation, where } of wanted) {
+    const rd = ownLookup(relations, relation);
+    const label = `${modelName(ctx, mm)}.${prismaRelationName(ctx, mm, relation)}`;
+    const parentColumn = rd ? singleColumn(rd.referenceKey) : undefined;
+    const childColumn = rd ? singleColumn(rd.foreignKey) : undefined;
+    if (rd?.type !== 'hasMany' || parentColumn === undefined || childColumn === undefined) {
+      throw new UnsupportedFeatureError(
+        `a nested or filtered \`_count\` of "${label}"`,
+        'prisma-compat',
+        rd?.type === 'manyToMany'
+          ? 'Below the top level, and with a `where`, only one-to-many relations are counted. Count the ' +
+              'junction rows with a groupBy on the related model, or use an unfiltered top-level `_count`.'
+          : 'Below the top level, and with a `where`, only one-to-many relations on a single-column key are ' +
+              'counted. Use a groupBy on the related model.',
+      );
+    }
+    const target = ownLookup(ctx.schema.tables, rd.to);
+    const targetModel = relTargetModel(ctx, mm, relation);
+    plan.counts.push({
+      relation,
+      table: rd.to,
+      parentField: meta?.reverseColumnMap?.[parentColumn] ?? parentColumn,
+      childField: target?.reverseColumnMap?.[childColumn] ?? childColumn,
+      ...(where !== undefined
+        ? { where: targetModel ? translateWhere(ctx, targetModel, where) : (where as Record<string, unknown>) }
+        : {}),
+    });
+  }
+  return undefined;
+}
+
+/** A value usable as a Map key that equals for equal key values (a Date by its instant). */
+function countKeyOf(value: unknown): unknown {
+  return value instanceof Date ? `date:${value.getTime()}` : value;
+}
+
+/** Every raw row at one plan level, in result order. */
+function collectPlanRows(
+  rows: readonly unknown[],
+  plan: ReadPlan,
+  into: Map<ReadPlan, Record<string, unknown>[]>,
+): void {
+  const level = into.get(plan) ?? [];
+  into.set(plan, level);
+  for (const row of rows) {
+    if (!isPlainRecord(row)) continue;
+    level.push(row);
+    for (const [rel, child] of plan.children) {
+      const value = row[rel];
+      const next = Array.isArray(value) ? value : value == null ? [] : [value];
+      collectPlanRows(next, child, into);
+    }
+  }
+}
+
+/**
+ * Run every count a {@link ReadPlan} holds and attach it to core's raw rows as
+ * `_count`, keyed by turbine relation name (the reshape renames it).
+ */
+async function attachPlannedCounts(
+  table: (name: string) => CompatQueryInterface,
+  raw: unknown,
+  plan: ReadPlan,
+  passthrough: Record<string, unknown>,
+): Promise<void> {
+  const levels = new Map<ReadPlan, Record<string, unknown>[]>();
+  collectPlanRows(Array.isArray(raw) ? raw : raw == null ? [] : [raw], plan, levels);
+  for (const [level, rows] of levels) {
+    if (level.counts.length === 0) continue;
+    for (const row of rows) row._count = {};
+    for (const req of level.counts) {
+      const ids = [...new Set(rows.map((r) => r[req.parentField]).filter((v) => v !== null && v !== undefined))];
+      const counts = new Map<unknown, number>();
+      if (ids.length > 0) {
+        const byParent = { [req.childField]: { in: ids } };
+        const groups = await table(req.table).groupBy({
+          ...passthrough,
+          by: [req.childField],
+          where: req.where ? { AND: [byParent, req.where] } : byParent,
+          _count: true,
+        });
+        for (const group of groups as Record<string, unknown>[]) {
+          counts.set(countKeyOf(group[req.childField]), Number(group._count));
+        }
+      }
+      for (const row of rows) {
+        (row._count as Record<string, number>)[req.relation] = counts.get(countKeyOf(row[req.parentField])) ?? 0;
+      }
+    }
+  }
+}
+
+/** Drop the keys this layer added (or an `omit` asked for) from reshaped, Prisma-named rows. */
+function trimPlannedRows(ctx: Ctx, rows: unknown, plan: ReadPlan): unknown {
+  const trimRow = (row: unknown, level: ReadPlan): unknown => {
+    if (!isPlainRecord(row)) return row;
+    let out = row;
+    if (level.keep) {
+      out = {};
+      for (const key of level.keep) if (Object.hasOwn(row, key)) setOwn(out, key, row[key]);
+    } else if (level.drop) {
+      out = { ...row };
+      for (const key of level.drop) delete out[key];
+    }
+    for (const [rel, child] of level.children) {
+      const key = prismaRelationName(ctx, level.mm, rel);
+      const value = out[key];
+      if (value === undefined) continue;
+      if (out === row) out = { ...row };
+      out[key] = Array.isArray(value) ? value.map((v) => trimRow(v, child)) : trimRow(value, child);
+    }
+    return out;
+  };
+  return Array.isArray(rows) ? rows.map((r) => trimRow(r, plan)) : trimRow(rows, plan);
 }
 
 /**
@@ -1109,9 +1479,9 @@ function assertWriteProjectionField(ctx: Ctx, mm: PrismaModelMap, op: string, cl
  * SQL-level control is `pii: true` on the column, which is enforced in core and
  * is unaffected by any of this.
  *
- * A relation (or `_count`) key THROWS instead: a write returns its own row and
- * nothing else, so serving it is impossible, and the alternative is handing
- * back a row whose relation property is silently `undefined`, which would hide an unsupported projection.
+ * A projection naming a relation (or `_count`) never reaches this function: the
+ * delegate runs that write as the write plus a read-back (see
+ * `projectsRelations` in makeDelegate). The refusals below are the backstop.
  */
 function resolveWriteProjection(
   ctx: Ctx,
@@ -1282,7 +1652,14 @@ function assertNestedRelationKeys(label: string, opts: Record<string, unknown>):
  * one arg with relation hops and then nests the other cannot spend two separate
  * budgets to reach the same stack depth.
  */
-function translateWithOption(ctx: Ctx, mm: PrismaModelMap, turbineRel: string, val: unknown, depth = 0): unknown {
+function translateWithOption(
+  ctx: Ctx,
+  mm: PrismaModelMap,
+  turbineRel: string,
+  val: unknown,
+  depth = 0,
+  parentPlan?: ReadPlan,
+): unknown {
   if (val === true) return true;
   const label = `${modelName(ctx, mm)}.${prismaRelationName(ctx, mm, turbineRel)}`;
   if (!isPlainRecord(val)) {
@@ -1325,7 +1702,9 @@ function translateWithOption(ctx: Ctx, mm: PrismaModelMap, turbineRel: string, v
           '`turbine migrate-from-prisma`, or drop the projection.',
       );
     }
-    const proj = translateProjection(ctx, target, val, depth);
+    const childPlan = newReadPlan(target, false);
+    const proj = translateProjection(ctx, target, val, depth, childPlan);
+    if (parentPlan) parentPlan.children.set(turbineRel, childPlan);
     if (proj.select) opt.select = proj.select;
     // Same silent drop as the top level: a nested `omit` names the sensitive
     // column on the CHILD rows, which are just as exposed.
@@ -1341,16 +1720,18 @@ function isUnfilteredCountWhere(where: unknown): boolean {
 }
 
 /**
- * Translate a Prisma `_count: { select: { rel: true } }` / `true` into Turbine
- * `with._count`.
- *
- * Core counts a relation whole: `with._count` takes `true` or `{ rel: true }`.
- * So a Prisma filtered count (`{ rel: { where } }`) is refused (E017) naming the
- * alternative, a relation that is not on the model is E003, and so is any key
- * but `select` under `_count` (a misspelled `selec` used to count EVERY relation,
- * and a misspelled relation counted nothing, both without a word).
+ * Validate a Prisma `_count` value and read it as the relations it counts:
+ * `true` (every to-many relation) or a list of turbine relation names, each with
+ * the caller's `where` when it filters anything. {@link planCounts} decides who
+ * computes them. A relation that is not on the model is E003, and so is any key
+ * but `select` under `_count` (a misspelled `selec` used to count EVERY
+ * relation, and a misspelled relation counted nothing, both without a word).
  */
-function translateCountSelect(ctx: Ctx, mm: PrismaModelMap, val: unknown): unknown {
+function translateCountSelect(
+  ctx: Ctx,
+  mm: PrismaModelMap,
+  val: unknown,
+): true | { relation: string; where?: unknown }[] {
   if (val === true) return true;
   const model = modelName(ctx, mm);
   if (!isPlainRecord(val)) {
@@ -1375,7 +1756,7 @@ function translateCountSelect(ctx: Ctx, mm: PrismaModelMap, val: unknown): unkno
         `received ${describeValue(val.select)}.`,
     );
   }
-  const out: Record<string, boolean> = {};
+  const out: { relation: string; where?: unknown }[] = [];
   for (const [key, v] of Object.entries(val.select)) {
     if (v === undefined || v === false || v === null) continue;
     const rel = ownLookup(mm.relations, key);
@@ -1389,7 +1770,7 @@ function translateCountSelect(ctx: Ctx, mm: PrismaModelMap, val: unknown): unkno
       );
     }
     if (v === true) {
-      setOwn(out, rel.name, true);
+      out.push({ relation: rel.name });
       continue;
     }
     if (!isPlainRecord(v)) {
@@ -1407,20 +1788,7 @@ function translateCountSelect(ctx: Ctx, mm: PrismaModelMap, val: unknown): unkno
           ' The only key is "where".',
       );
     }
-    if (!isUnfilteredCountWhere(v.where)) {
-      const target = relTargetModel(ctx, mm, rel.name);
-      const targetName = target ? modelName(ctx, target) : undefined;
-      const delegate = targetName ? (prismaPropertyAlias(targetName) ?? targetName) : '<model>';
-      throw new UnsupportedFeatureError(
-        `a filtered relation count (\`_count.select.${key}.where\` on model "${model}")`,
-        'prisma-compat',
-        'Turbine counts every row of a relation, so the filter would be dropped and the number would be wrong. ' +
-          `Count the filtered rows through the related model instead: prisma.${delegate}.count({ where: ... }) ` +
-          `with the foreign key and your filter, or prisma.${delegate}.groupBy({ by: [<foreign key>], _count: true }) ` +
-          'for many parents at once.',
-      );
-    }
-    setOwn(out, rel.name, true);
+    out.push(isUnfilteredCountWhere(v.where) ? { relation: rel.name } : { relation: rel.name, where: v.where });
   }
   return out;
 }
@@ -1468,6 +1836,7 @@ function translateReadArgs(
   mm: PrismaModelMap,
   prismaArgs: Record<string, unknown>,
   kind: ReadKind,
+  plan: ReadPlan = newReadPlan(mm, true),
 ): Record<string, unknown> {
   const t: Record<string, unknown> = {};
   // FIRST, so a per-call `stableRelationOrder` overrides it: the client-level
@@ -1478,7 +1847,7 @@ function translateReadArgs(
   applyNativeOptions(kind === 'unique' ? FIND_UNIQUE_OPTIONS : FIND_MANY_OPTIONS, prismaArgs, t);
   if (prismaArgs.where !== undefined) t.where = translateWhere(ctx, mm, prismaArgs.where);
   if (prismaArgs.orderBy !== undefined) t.orderBy = translateOrderBy(ctx, mm, prismaArgs.orderBy);
-  const proj = translateProjection(ctx, mm, prismaArgs);
+  const proj = translateProjection(ctx, mm, prismaArgs, 0, plan);
   if (proj.select) t.select = proj.select;
   if (proj.omit) t.omit = proj.omit;
   if (proj.with) t.with = proj.with;
@@ -1639,7 +2008,7 @@ function translateWriteData(ctx: Ctx, mm: PrismaModelMap, data: unknown, depth =
     const rel = ownLookup(mm.relations, key);
     if (rel && isPlainRecord(val) && Object.keys(val).some((k) => NESTED_WRITE_OPS.has(k))) {
       const target = relTargetModel(ctx, mm, rel.name);
-      setOwn(out, rel.name, translateNestedWrite(ctx, target, val, depth + 1));
+      setOwn(out, rel.name, translateNestedWrite(ctx, target, val, depth + 1, rel.cardinality === 'one'));
       continue;
     }
     setOwn(out, renameField(mm, key), val);
@@ -1675,13 +2044,23 @@ function translateNestedWrite(
   target: PrismaModelMap | undefined,
   ops: Record<string, unknown>,
   depth: number,
+  toOne = false,
 ): unknown {
   const out: Record<string, unknown> = {};
+  // Rows a nested write CREATES get the target model's client defaults
+  // (`cuid()` / `uuid()` ids, `@default(now())`, `@updatedAt`) and rows it
+  // UPDATES get `@updatedAt`, exactly as the top-level row does: Prisma fills
+  // them at every depth, and a nested row without its id reached the database
+  // as NULL.
+  const created = (p: unknown) =>
+    target ? translateWriteData(ctx, target, applyCreateDefaults(target, p), depth + 1) : p;
   for (const [op, payload] of Object.entries(ops)) {
     switch (op) {
       case 'create':
+        out[op] = mapMaybeArray(payload, created);
+        break;
       case 'createMany':
-        out[op] = mapMaybeArray(payload, (p) => (target ? translateWriteData(ctx, target, p, depth + 1) : p));
+        out[op] = translateNestedCreateMany(payload, created);
         break;
       case 'connect':
       case 'disconnect':
@@ -1690,9 +2069,18 @@ function translateNestedWrite(
         out[op] = mapMaybeArray(payload, (p) => (target ? translateWhere(ctx, target, p, depth + 1) : p));
         break;
       case 'deleteMany':
-      case 'updateMany':
-      case 'update':
         out[op] = mapMaybeArray(payload, (p) => translateWhereDataPair(ctx, target, op, p, depth + 1));
+        break;
+      case 'updateMany':
+        out[op] = mapMaybeArray(payload, (p) => translateWhereDataPair(ctx, target, op, p, depth + 1, true));
+        break;
+      case 'update':
+        out[op] = mapMaybeArray(payload, (p) => {
+          const pair = translateWhereDataPair(ctx, target, op, p, depth + 1, true);
+          // Prisma's to-one `update` takes the data itself (`profile: { update:
+          // { bio } }`) as well as `{ data }`; core reads `{ data }`.
+          return toOne && isPlainRecord(p) && !('data' in p) && !('where' in p) ? { data: pair } : pair;
+        });
         break;
       case 'connectOrCreate':
         out[op] = mapMaybeArray(payload, (p) => translateConnectOrCreate(ctx, target, p, depth + 1));
@@ -1735,16 +2123,32 @@ function translateWhereDataPair(
   op: string,
   p: unknown,
   depth: number,
+  touch = false,
 ): unknown {
   if (!isPlainRecord(p)) return p;
+  const data = (d: unknown) =>
+    target ? translateWriteData(ctx, target, touch ? applyUpdateTouch(target, d) : d, depth) : d;
   if ('data' in p || 'where' in p) {
     assertNestedPayloadKeys(op, p, ['where', 'data']);
     const out: Record<string, unknown> = {};
     if (p.where !== undefined) out.where = target ? translateWhere(ctx, target, p.where, depth) : p.where;
-    if (p.data !== undefined) out.data = target ? translateWriteData(ctx, target, p.data, depth) : p.data;
+    if (p.data !== undefined) out.data = data(p.data);
     return out;
   }
-  return target ? translateWriteData(ctx, target, p, depth) : p;
+  return data(p);
+}
+
+/**
+ * A nested `createMany: { data, skipDuplicates }`. Its rows are translated (and
+ * get client defaults) like nested `create` rows; the wrapper keys pass through
+ * for core to validate.
+ */
+function translateNestedCreateMany(payload: unknown, created: (row: unknown) => unknown): unknown {
+  if (!isPlainRecord(payload)) return payload;
+  assertNestedPayloadKeys('createMany', payload, ['data', 'skipDuplicates']);
+  const out: Record<string, unknown> = { ...payload };
+  if (payload.data !== undefined) out.data = mapMaybeArray(payload.data, created);
+  return out;
 }
 
 function translateConnectOrCreate(ctx: Ctx, target: PrismaModelMap | undefined, p: unknown, depth: number): unknown {
@@ -1752,7 +2156,9 @@ function translateConnectOrCreate(ctx: Ctx, target: PrismaModelMap | undefined, 
   assertNestedPayloadKeys('connectOrCreate', p, ['where', 'create']);
   const out: Record<string, unknown> = {};
   if (p.where !== undefined) out.where = target ? translateWhere(ctx, target, p.where, depth) : p.where;
-  if (p.create !== undefined) out.create = target ? translateWriteData(ctx, target, p.create, depth) : p.create;
+  if (p.create !== undefined) {
+    out.create = target ? translateWriteData(ctx, target, applyCreateDefaults(target, p.create), depth) : p.create;
+  }
   return out;
 }
 
@@ -1761,8 +2167,12 @@ function translateUpsertNested(ctx: Ctx, target: PrismaModelMap | undefined, p: 
   assertNestedPayloadKeys('upsert', p, ['where', 'create', 'update']);
   const out: Record<string, unknown> = {};
   if (p.where !== undefined) out.where = target ? translateWhere(ctx, target, p.where, depth) : p.where;
-  if (p.create !== undefined) out.create = target ? translateWriteData(ctx, target, p.create, depth) : p.create;
-  if (p.update !== undefined) out.update = target ? translateWriteData(ctx, target, p.update, depth) : p.update;
+  if (p.create !== undefined) {
+    out.create = target ? translateWriteData(ctx, target, applyCreateDefaults(target, p.create), depth) : p.create;
+  }
+  if (p.update !== undefined) {
+    out.update = target ? translateWriteData(ctx, target, applyUpdateTouch(target, p.update), depth) : p.update;
+  }
   return out;
 }
 
@@ -2103,9 +2513,11 @@ export interface PrismaModelDelegate<M extends PrismaModelTypes> {
  * the transaction's own connection.
  */
 export interface PrismaCompatRawSurface {
-  $queryRaw<T = unknown>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T[]>;
+  /** A tagged template, or one fragment (`$queryRaw(Prisma.sql\`...\`)`), as in Prisma. */
+  $queryRaw<T = unknown>(strings: TemplateStringsArray | SqlFragmentLike, ...values: unknown[]): Promise<T[]>;
   $queryRawUnsafe<T = unknown>(sql: string, ...params: unknown[]): Promise<T[]>;
-  $executeRaw(strings: TemplateStringsArray, ...values: unknown[]): Promise<number>;
+  /** A tagged template, or one fragment (`$executeRaw(Prisma.sql\`...\`)`), as in Prisma. */
+  $executeRaw(strings: TemplateStringsArray | SqlFragmentLike, ...values: unknown[]): Promise<number>;
   $executeRawUnsafe(sql: string, ...params: unknown[]): Promise<number>;
 }
 
@@ -2179,7 +2591,13 @@ export interface PrismaCompatClientBase<S extends Record<string, PrismaModelType
    * extensions throw, see {@link PrismaCompatExtension}.
    */
   $extends<E extends PrismaCompatExtension>(extension: E): PrismaCompatExtendedClient<S, E>;
+  /** Open a connection now (core `connect()`: one `SELECT 1`), so a bad URL fails here rather than at the first query. */
   $connect(): Promise<void>;
+  /**
+   * Close the wrapped client's pool (core `disconnect()`), so a script can
+   * exit. Idempotent, and shared by every `$extends` of this client. Unlike
+   * Prisma the pool is not reopened by a later query: build a new client.
+   */
   $disconnect(): Promise<void>;
 }
 
@@ -2475,6 +2893,136 @@ function makeDelegate(
     }, batchable);
   };
 
+  /**
+   * One read operation. The {@link ReadPlan} filled by the translation says
+   * whether this layer has counts to run (then the read and its counts share a
+   * transaction, and a `$transaction([...])` array takes its sequential path)
+   * and keys to trim off the reshaped rows.
+   */
+  const readCall = (
+    op: 'findMany' | 'findFirst' | 'findUnique' | 'findFirstOrThrow' | 'findUniqueOrThrow',
+    args: Args | undefined,
+    kind: ReadKind,
+    read: (qi: CompatQueryInterface, t: Args) => Promise<unknown>,
+    build: (qi: CompatQueryInterface, t: Args) => DeferredQuery<unknown>,
+    reshape: (raw: unknown) => unknown,
+  ) => {
+    let plan = newReadPlan(mm, true);
+    const finish = (raw: unknown) => {
+      const shaped = reshape(raw);
+      return planHasTrim(plan) ? trimPlannedRows(ctx, shaped, plan) : shaped;
+    };
+    const withCounts = async (table: (name: string) => CompatQueryInterface, t: Args) => {
+      const raw = await read(table(mm.table), t);
+      const passthrough: Args = {};
+      if (t.skipGlobalFilters !== undefined) passthrough.skipGlobalFilters = t.skipGlobalFilters;
+      if (t.timeout !== undefined) passthrough.timeout = t.timeout;
+      await attachPlannedCounts(table, raw, plan, passthrough);
+      return finish(raw);
+    };
+    return defer(
+      op,
+      args,
+      () => {
+        plan = newReadPlan(mm, true);
+        const a = kind === 'unique' ? requireWhere(args, op) : (args ?? {});
+        return translateReadArgs(ctx, mm, a, kind, plan);
+      },
+      (qi, t) => (planHasCounts(plan) ? runInTx((table) => withCounts(table, t)) : read(qi, t).then(finish)),
+      {
+        build,
+        reshape: finish,
+        nested: () => planHasCounts(plan),
+        execInTx: (table, t) => (planHasCounts(plan) ? withCounts(table, t) : read(table(mm.table), t).then(finish)),
+      },
+    );
+  };
+
+  /**
+   * A write whose `include` / `select` names a relation or `_count`. A write
+   * statement returns its own row only, so these run as Prisma's semantics
+   * describe them: the write, then a read of the written row by primary key with
+   * the caller's projection, in ONE transaction (a delete reads first, since
+   * afterwards there is nothing to read). The read is an ordinary compat read,
+   * so nested and filtered counts work there too.
+   */
+  const projectsRelations = (a: Args | undefined): boolean => {
+    if (!a) return false;
+    const include = a.include;
+    if (isPlainRecord(include) && Object.values(include).some((v) => v !== false && v != null)) return true;
+    const select = a.select;
+    if (!isPlainRecord(select)) return false;
+    return Object.entries(select).some(
+      ([key, v]) => v !== false && v != null && (key === '_count' || ownLookup(mm.relations, key) !== undefined),
+    );
+  };
+  const projectionOf = (a: Args): Args => {
+    const out: Args = {};
+    if (a.select !== undefined) out.select = a.select;
+    if (a.include !== undefined) out.include = a.include;
+    if (a.omit !== undefined) out.omit = a.omit;
+    return out;
+  };
+  /** Validate the projection before anything is written (its errors would otherwise follow the write). */
+  const checkReadProjection = (a: Args): void => {
+    translateProjection(ctx, mm, projectionOf(a), 0, newReadPlan(mm, true));
+  };
+  /** The Prisma `where` naming one written row by primary key, from core's raw row. */
+  const primaryKeyWhere = (op: string, raw: unknown): Args => {
+    const fields = primaryKeyFields(ctx, mm);
+    if (fields.length === 0 || !isPlainRecord(raw)) {
+      throw new UnsupportedFeatureError(
+        `include / a relation select on ${op} of model "${modelName(ctx, mm)}"`,
+        'prisma-compat',
+        'The written row is read back by primary key and this model has none. Read the relation with a ' +
+          'separate findUnique inside the same $transaction.',
+      );
+    }
+    const where: Args = {};
+    for (const field of fields) setOwn(where, prismaFieldName(ctx, mm, field), raw[field]);
+    return where;
+  };
+  const readWritten = async (table: (name: string) => CompatQueryInterface, where: Args, a: Args) => {
+    const plan = newReadPlan(mm, true);
+    const t = translateReadArgs(ctx, mm, { where, ...projectionOf(a) }, 'unique', plan);
+    const raw = await table(mm.table).findUnique(t);
+    if (planHasCounts(plan)) await attachPlannedCounts(table, raw, plan, {});
+    const shaped = reshapeRowOrNull(ctx, mm, raw);
+    return planHasTrim(plan) ? trimPlannedRows(ctx, shaped, plan) : shaped;
+  };
+  const writeThenRead = (
+    op: string,
+    a: Args,
+    write: (qi: CompatQueryInterface) => Promise<unknown>,
+  ): ((table: (name: string) => CompatQueryInterface) => Promise<unknown>) => {
+    if (op === 'delete') {
+      return async (table) => {
+        const before = await readWritten(table, a.where as Args, a);
+        await write(table(mm.table));
+        return before;
+      };
+    }
+    return async (table) => readWritten(table, primaryKeyWhere(op, await write(table(mm.table))), a);
+  };
+
+  /**
+   * A write's own row, Prisma-shaped. Core returns the relations a nested write
+   * touched (it reads the written tree back); a Prisma write without `include`
+   * returns scalars only, so those keys are dropped rather than handed to a
+   * caller who never asked for them.
+   */
+  const writtenRow = (raw: unknown): unknown => {
+    const row = reshapeRow(ctx, mm, raw);
+    if (!isPlainRecord(row)) return row;
+    let out = row;
+    for (const key of Object.keys(row)) {
+      if (key !== '_count' && ownLookup(mm.relations, key) === undefined) continue;
+      if (out === row) out = { ...row };
+      delete out[key];
+    }
+    return out;
+  };
+
   const requireWhere = (args: Args | undefined, op: string): Args => {
     if (!args || args.where === undefined) {
       throw new ValidationError(`prisma-compat: ${op} on "${modelName(ctx, mm)}" requires a \`where\`.`);
@@ -2484,67 +3032,77 @@ function makeDelegate(
 
   return {
     findMany: (args = {}) =>
-      defer(
+      readCall(
         'findMany',
         args,
-        () => translateReadArgs(ctx, mm, args, 'many'),
-        (qi, t) => qi.findMany(t).then((r) => reshapeRows(ctx, mm, r)),
-        { build: (qi, t) => qi.buildFindMany(t), reshape: (raw) => reshapeRows(ctx, mm, raw) },
+        'many',
+        (qi, t) => qi.findMany(t),
+        (qi, t) => qi.buildFindMany(t),
+        (raw) => reshapeRows(ctx, mm, raw),
       ) as unknown as Promise<PrismaModelTypes['Row'][]>,
     findFirst: (args = {}) =>
-      defer(
+      readCall(
         'findFirst',
         args,
-        () => translateReadArgs(ctx, mm, args, 'first'),
-        (qi, t) => qi.findFirst(t).then((r) => reshapeRowOrNull(ctx, mm, r)),
-        { build: (qi, t) => qi.buildFindFirst(t), reshape: (raw) => reshapeRowOrNull(ctx, mm, raw) },
+        'first',
+        (qi, t) => qi.findFirst(t),
+        (qi, t) => qi.buildFindFirst(t),
+        (raw) => reshapeRowOrNull(ctx, mm, raw),
       ) as unknown as Promise<PrismaModelTypes['Row'] | null>,
     findUnique: (args) =>
-      defer(
+      readCall(
         'findUnique',
         args,
-        () => translateReadArgs(ctx, mm, requireWhere(args, 'findUnique'), 'unique'),
-        (qi, t) => qi.findUnique(t).then((r) => reshapeRowOrNull(ctx, mm, r)),
-        { build: (qi, t) => qi.buildFindUnique(t), reshape: (raw) => reshapeRowOrNull(ctx, mm, raw) },
+        'unique',
+        (qi, t) => qi.findUnique(t),
+        (qi, t) => qi.buildFindUnique(t),
+        (raw) => reshapeRowOrNull(ctx, mm, raw),
       ) as unknown as Promise<PrismaModelTypes['Row'] | null>,
     findFirstOrThrow: (args = {}) =>
-      defer(
+      readCall(
         'findFirstOrThrow',
         args,
-        () => translateReadArgs(ctx, mm, args, 'first'),
-        (qi, t) => qi.findFirstOrThrow(t).then((r) => reshapeRow(ctx, mm, r)),
-        { build: (qi, t) => qi.buildFindFirstOrThrow(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
+        'first',
+        (qi, t) => qi.findFirstOrThrow(t),
+        (qi, t) => qi.buildFindFirstOrThrow(t),
+        (raw) => reshapeRow(ctx, mm, raw),
       ) as unknown as Promise<PrismaModelTypes['Row']>,
     findUniqueOrThrow: (args) =>
-      defer(
+      readCall(
         'findUniqueOrThrow',
         args,
-        () => translateReadArgs(ctx, mm, requireWhere(args, 'findUniqueOrThrow'), 'unique'),
-        (qi, t) => qi.findUniqueOrThrow(t).then((r) => reshapeRow(ctx, mm, r)),
-        { build: (qi, t) => qi.buildFindUniqueOrThrow(t), reshape: (raw) => reshapeRow(ctx, mm, raw) },
+        'unique',
+        (qi, t) => qi.findUniqueOrThrow(t),
+        (qi, t) => qi.buildFindUniqueOrThrow(t),
+        (raw) => reshapeRow(ctx, mm, raw),
       ) as unknown as Promise<PrismaModelTypes['Row']>,
     create: (args) => {
       // Resolved inside the translate thunk below (so it validates before the
       // write runs and stays deferred), read back by every result path.
       let proj: WriteProjection = NO_WRITE_PROJECTION;
-      const shape = (raw: unknown) => applyWriteProjection(proj, reshapeRow(ctx, mm, raw));
+      const shape = (raw: unknown) => applyWriteProjection(proj, writtenRow(raw));
+      const a = (args ?? {}) as Args;
+      const relational = projectsRelations(a);
+      const projected = (t: Args) => writeThenRead('create', a, (qi) => qi.create(t));
       return defer(
         'create',
         args,
         () => {
-          proj = resolveWriteProjection(ctx, mm, 'create', args as Args);
+          if (relational) checkReadProjection(a);
+          else proj = resolveWriteProjection(ctx, mm, 'create', a);
           const t: Args = {
-            data: translateWriteData(ctx, mm, applyCreateDefaults(mm, (args as Args).data)),
+            data: translateWriteData(ctx, mm, applyCreateDefaults(mm, a.data)),
             ...coreWriteProjection(mm, proj),
           };
-          applyNativeOptions(CREATE_OPTIONS, args as Args, t);
+          applyNativeOptions(CREATE_OPTIONS, a, t);
           return t;
         },
-        (qi, t) => qi.create(t).then(shape),
+        (qi, t) => (relational ? runInTx(projected(t)) : qi.create(t).then(shape)),
         {
           build: (qi, t) => qi.buildCreate(t),
           reshape: shape,
-          nested: (t) => hasNestedKeys(ctx, mm, t.data),
+          nested: (t) => relational || hasNestedKeys(ctx, mm, t.data),
+          execInTx: (table, t) => (relational ? projected(t)(table) : table(mm.table).create(t).then(shape)),
         },
       ) as unknown as Promise<PrismaModelTypes['Row']>;
     },
@@ -2592,13 +3150,16 @@ function makeDelegate(
       ) as unknown as Promise<{ count: number }>,
     update: (args) => {
       let proj: WriteProjection = NO_WRITE_PROJECTION;
-      const shape = (raw: unknown) => applyWriteProjection(proj, reshapeRow(ctx, mm, raw));
+      const shape = (raw: unknown) => applyWriteProjection(proj, writtenRow(raw));
+      const relational = projectsRelations(args as Args | undefined);
+      const projected = (t: Args) => writeThenRead('update', args as Args, (qi) => qi.update(t));
       return defer(
         'update',
         args,
         () => {
           const a = requireWhere(args, 'update');
-          proj = resolveWriteProjection(ctx, mm, 'update', a);
+          if (relational) checkReadProjection(a);
+          else proj = resolveWriteProjection(ctx, mm, 'update', a);
           const t: Args = {
             where: translateWhere(ctx, mm, a.where),
             data: translateWriteData(ctx, mm, applyUpdateTouch(mm, a.data)),
@@ -2616,11 +3177,12 @@ function makeDelegate(
           }
           return t;
         },
-        (qi, t) => qi.update(t).then(shape),
+        (qi, t) => (relational ? runInTx(projected(t)) : qi.update(t).then(shape)),
         {
           build: (qi, t) => qi.buildUpdate(t),
           reshape: shape,
-          nested: (t) => hasNestedKeys(ctx, mm, t.data),
+          nested: (t) => relational || hasNestedKeys(ctx, mm, t.data),
+          execInTx: (table, t) => (relational ? projected(t)(table) : table(mm.table).update(t).then(shape)),
         },
       ) as unknown as Promise<PrismaModelTypes['Row']>;
     },
@@ -2647,19 +3209,27 @@ function makeDelegate(
       ) as unknown as Promise<{ count: number }>,
     delete: (args) => {
       let proj: WriteProjection = NO_WRITE_PROJECTION;
-      const shape = (raw: unknown) => applyWriteProjection(proj, reshapeRow(ctx, mm, raw));
+      const shape = (raw: unknown) => applyWriteProjection(proj, writtenRow(raw));
+      const relational = projectsRelations(args as Args | undefined);
+      const projected = (t: Args) => writeThenRead('delete', args as Args, (qi) => qi.delete(t));
       return defer(
         'delete',
         args,
         () => {
           const a = requireWhere(args, 'delete');
-          proj = resolveWriteProjection(ctx, mm, 'delete', a);
+          if (relational) checkReadProjection(a);
+          else proj = resolveWriteProjection(ctx, mm, 'delete', a);
           const t: Args = { where: translateWhere(ctx, mm, a.where), ...coreWriteProjection(mm, proj) };
           applyNativeOptions(DELETE_OPTIONS, a, t);
           return t;
         },
-        (qi, t) => qi.delete(t).then(shape),
-        { build: (qi, t) => qi.buildDelete(t), reshape: shape },
+        (qi, t) => (relational ? runInTx(projected(t)) : qi.delete(t).then(shape)),
+        {
+          build: (qi, t) => qi.buildDelete(t),
+          reshape: shape,
+          nested: () => relational,
+          execInTx: (table, t) => (relational ? projected(t)(table) : table(mm.table).delete(t).then(shape)),
+        },
       ) as unknown as Promise<PrismaModelTypes['Row']>;
     },
     deleteMany: (args = {}) =>
@@ -2680,13 +3250,16 @@ function makeDelegate(
       ) as unknown as Promise<{ count: number }>,
     upsert: (args) => {
       let proj: WriteProjection = NO_WRITE_PROJECTION;
-      const shape = (raw: unknown) => applyWriteProjection(proj, reshapeRow(ctx, mm, raw));
+      const shape = (raw: unknown) => applyWriteProjection(proj, writtenRow(raw));
+      const relational = projectsRelations(args as Args | undefined);
+      const projected = (t: Args) => writeThenRead('upsert', args as Args, (qi) => qi.upsert(t));
       return defer(
         'upsert',
         args,
         () => {
           const a = requireWhere(args, 'upsert');
-          proj = resolveWriteProjection(ctx, mm, 'upsert', a);
+          if (relational) checkReadProjection(a);
+          else proj = resolveWriteProjection(ctx, mm, 'upsert', a);
           const t: Args = {
             where: translateWhere(ctx, mm, a.where),
             create: translateWriteData(ctx, mm, applyCreateDefaults(mm, a.create)),
@@ -2699,14 +3272,14 @@ function makeDelegate(
         // Core `upsert` has Prisma's semantics itself (it looks the row up by
         // `where` whenever one conflict statement would mean something else,
         // and runs nested writes), so the adapter passes it straight through.
-        (qi, t) => qi.upsert(t).then(shape),
+        (qi, t) => (relational ? runInTx(projected(t)) : qi.upsert(t).then(shape)),
         {
           build: (qi, t) => qi.buildUpsert(t),
           reshape: shape,
           // Batchable only when core would run it as one statement. PowDB has
           // no deferred statements at all, so it always takes the tx path.
-          nested: (t, qi) => qi.upsertNeedsLookup?.(t) ?? true,
-          execInTx: async (table, t) => shape(await table(mm.table).upsert(t)),
+          nested: (t, qi) => relational || (qi.upsertNeedsLookup?.(t) ?? true),
+          execInTx: async (table, t) => (relational ? projected(t)(table) : shape(await table(mm.table).upsert(t))),
         },
       ) as unknown as Promise<PrismaModelTypes['Row']>;
     },
@@ -2753,17 +3326,27 @@ function makeDelegate(
         (qi, t) => qi.aggregate(t).then((r) => reshapeAggregate(ctx, mm, r)),
         { build: (qi, t) => qi.buildAggregate(t), reshape: (raw) => reshapeAggregate(ctx, mm, raw) },
       ) as unknown as Promise<Record<string, unknown>>,
-    groupBy: (args) =>
-      defer(
+    groupBy: (args) => {
+      // Core always counts a group when `_count` is omitted (its documented
+      // default); Prisma returns only the blocks the call names. The count
+      // still runs (an `orderBy: { _count }` reads it), it is just not handed
+      // back unasked.
+      const askedForCount = isPlainRecord(args) && args._count !== undefined && args._count !== false;
+      const reshape = (raw: unknown) =>
+        (raw as unknown[]).map((r) => {
+          const row = reshapeGroupRow(ctx, mm, r);
+          if (askedForCount || !isPlainRecord(row) || !Object.hasOwn(row, '_count')) return row;
+          const { _count: _dropped, ...rest } = row;
+          return rest;
+        });
+      return defer(
         'groupBy',
         args,
         () => translateAggregateArgs(ctx, mm, args as Args, true),
-        (qi, t) => qi.groupBy(t).then((rows) => (rows as unknown[]).map((r) => reshapeGroupRow(ctx, mm, r))),
-        {
-          build: (qi, t) => qi.buildGroupBy(t),
-          reshape: (raw) => (raw as unknown[]).map((r) => reshapeGroupRow(ctx, mm, r)),
-        },
-      ) as unknown as Promise<Record<string, unknown>[]>,
+        (qi, t) => qi.groupBy(t).then(reshape),
+        { build: (qi, t) => qi.buildGroupBy(t), reshape },
+      ) as unknown as Promise<Record<string, unknown>[]>;
+    },
   };
 }
 
@@ -2801,6 +3384,7 @@ function flattenTemplate(
   strings: readonly string[],
   values: readonly unknown[],
   ph: (n: number) => string,
+  fragmentOf: FragmentReader,
 ): { text: string; params: unknown[] } {
   const params: unknown[] = [];
   let text = '';
@@ -2809,8 +3393,9 @@ function flattenTemplate(
       text += segStrings[i];
       if (i < segValues.length) {
         const v = segValues[i];
-        if (isSqlFragment(v)) {
-          append(v.strings, v.values);
+        const fragment = fragmentOf(v);
+        if (fragment) {
+          append(fragment.strings, fragment.values);
         } else {
           params.push(v);
           text += ph(params.length);
@@ -2837,23 +3422,144 @@ type RawExecutor = (
  * (`$queryRaw` → rows, `$executeRaw` → affected-row count). The only difference
  * is which connection the executor runs on.
  */
-function makeRawSurface(exec: RawExecutor, ph: (n: number) => string): PrismaCompatRawSurface {
+function makeRawSurface(
+  exec: RawExecutor,
+  ph: (n: number) => string,
+  fragmentOf: FragmentReader,
+): PrismaCompatRawSurface {
+  /**
+   * The statement a `$queryRaw` / `$executeRaw` call means. Prisma takes either a
+   * tagged template or ONE fragment (`$queryRaw(Prisma.sql\`...\`)`). The
+   * fragment form used to be read as a template whose `strings` was the
+   * fragment object itself, which has no indices, so the statement sent was the
+   * empty string and the call resolved to `[]` without a word.
+   */
+  const compose = (first: TemplateStringsArray | SqlFragmentLike, values: unknown[], method: string) => {
+    const fragment = fragmentOf(first);
+    if (fragment) {
+      if (values.length > 0) {
+        throw new ValidationError(
+          `prisma-compat: ${method}(fragment) takes the fragment alone; ${values.length} further ` +
+            'argument(s) would be ignored. Interpolate the values inside the fragment instead.',
+        );
+      }
+      return flattenTemplate(fragment.strings, fragment.values, ph, fragmentOf);
+    }
+    // Anything else that is not a template's strings array (a plain string, an
+    // object that is not a recognized fragment) would flatten to an empty or
+    // character-split statement. Prisma refuses those too.
+    if (!Array.isArray(first)) {
+      throw new ValidationError(
+        `prisma-compat: ${method} takes a tagged template (${method}\`SELECT ...\`) or one fragment ` +
+          `(${method}(Prisma.sql\`SELECT ...\`)), received ${describeValue(first)}. ` +
+          `For SQL text built at runtime use ${method}Unsafe(text, ...values).`,
+      );
+    }
+    return flattenTemplate(first as unknown as string[], values, ph, fragmentOf);
+  };
   return {
-    $queryRaw: async <T = unknown>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T[]> => {
-      const { text, params } = flattenTemplate(strings as unknown as string[], values, ph);
+    $queryRaw: async <T = unknown>(
+      strings: TemplateStringsArray | SqlFragmentLike,
+      ...values: unknown[]
+    ): Promise<T[]> => {
+      const { text, params } = compose(strings, values, '$queryRaw');
       return (await exec(text, params, '$queryRaw')).rows as T[];
     },
     $queryRawUnsafe: async <T = unknown>(sql: string, ...params: unknown[]): Promise<T[]> => {
       return (await exec(sql, params, '$queryRawUnsafe')).rows as T[];
     },
-    $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]): Promise<number> => {
-      const { text, params } = flattenTemplate(strings as unknown as string[], values, ph);
+    $executeRaw: async (strings: TemplateStringsArray | SqlFragmentLike, ...values: unknown[]): Promise<number> => {
+      const { text, params } = compose(strings, values, '$executeRaw');
       return (await exec(text, params, '$executeRaw')).rowCount ?? 0;
     },
     $executeRawUnsafe: async (sql: string, ...params: unknown[]): Promise<number> => {
       return (await exec(sql, params, '$executeRawUnsafe')).rowCount ?? 0;
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Core interop: the Turbine client under a compat client
+// ---------------------------------------------------------------------------
+
+/**
+ * Every compat client and transaction client this module builds, mapped to the
+ * core client or core transaction it runs on. A WeakMap rather than a property,
+ * so nothing is added to a surface whose every key is a model name or a Prisma
+ * `$` member, and a hand-made lookalike object is never mistaken for one.
+ */
+const CORE_OF = new WeakMap<object, unknown>();
+
+/** Each compat client's way of wrapping a core transaction it did not open. */
+const BIND_OF = new WeakMap<object, (tx: CompatTransactionClient) => Record<string, unknown>>();
+
+/**
+ * The Turbine client under a compat client: the `TurbineClient` it wraps for the
+ * client (or any `$extends` of it), and the core `TransactionClient` for the `tx`
+ * a `$transaction(async (tx) => ...)` callback receives (or one
+ * {@link bindTransaction} made). This is how code is moved off the compat surface
+ * one module at a time: a ported function takes the compat client, calls
+ * `turbineOf`, and uses Turbine's own API on the SAME connection, so inside a
+ * transaction it sees that transaction's uncommitted writes and is rolled back
+ * with it.
+ *
+ * Throws for anything this module did not build.
+ *
+ * @example
+ * ```ts
+ * await prisma.$transaction(async (tx) => {
+ *   await tx.user.update({ where: { id }, data: { name } });
+ *   const user = await turbineOf(tx).table('users').findUnique({ where: { id } }); // same transaction
+ * });
+ * ```
+ */
+export function turbineOf<S extends Record<string, PrismaModelTypes>>(compat: PrismaCompatClient<S>): TurbineClient;
+export function turbineOf<S extends Record<string, PrismaModelTypes>>(
+  tx: PrismaCompatTransactionClient<S>,
+): TransactionClient;
+export function turbineOf(compat: object): TurbineClient | TransactionClient;
+export function turbineOf(compat: object): TurbineClient | TransactionClient {
+  const core = typeof compat === 'object' && compat !== null ? CORE_OF.get(compat) : undefined;
+  if (core === undefined) {
+    throw new ValidationError(
+      'prisma-compat: turbineOf takes a client made by createPrismaCompatClient, or the `tx` one of its ' +
+        '$transaction callbacks receives.',
+    );
+  }
+  return core as TurbineClient | TransactionClient;
+}
+
+/**
+ * A compat transaction client running inside a core transaction this layer did
+ * not open: the other direction of {@link turbineOf}. Code already on Turbine's API
+ * opens `db.$transaction(async (core) => ...)` and calls into a module still
+ * written against the Prisma surface with `bindTransaction(prisma, core)`; every
+ * delegate call and raw statement on the result runs on `core`'s connection and
+ * commits or rolls back with it. The result has the same members as the `tx` of
+ * a compat `$transaction` callback (delegates, extension `model` members, the
+ * raw surface), and no `$transaction` of its own, as in Prisma.
+ *
+ * @example
+ * ```ts
+ * await db.$transaction(async (core) => {
+ *   await core.table('users').update({ where: { id }, data: { name } });
+ *   await legacyAudit(bindTransaction(prisma, core)); // still prisma.auditLog.create(...)
+ * });
+ * ```
+ */
+export function bindTransaction<S extends Record<string, PrismaModelTypes>>(
+  compat: PrismaCompatClient<S>,
+  tx: TransactionClient,
+): PrismaCompatTransactionClient<S>;
+export function bindTransaction(compat: object, tx: TransactionClient): PrismaCompatTransactionClient;
+export function bindTransaction(compat: object, tx: TransactionClient): PrismaCompatTransactionClient {
+  const bind = typeof compat === 'object' && compat !== null ? BIND_OF.get(compat) : undefined;
+  if (!bind) {
+    throw new ValidationError(
+      'prisma-compat: bindTransaction takes a client made by createPrismaCompatClient (not a transaction client).',
+    );
+  }
+  return bind(tx as unknown as CompatTransactionClient) as unknown as PrismaCompatTransactionClient;
 }
 
 // ---------------------------------------------------------------------------
@@ -3136,6 +3842,7 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
       stablePkOrder: options.stablePkOrder ?? false,
       prismaErrorCodes: options.prismaErrorCodes ?? false,
     },
+    fragmentOf: options.prismaNamespace === undefined ? ownFragment : foreignFragmentReader(options.prismaNamespace),
   };
 
   // Every model the client exposes: the map's Prisma models, plus the implicit
@@ -3174,6 +3881,23 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
   }
 
   const ph = placeholderOf(db);
+
+  // `$connect` / `$disconnect` used to be no-ops, so a script that ended with
+  // `await prisma.$disconnect()` kept the pool open and never exited. One
+  // closing promise per wrapped client: every extended client shares it, and a
+  // second call resolves with the first instead of ending the pool twice.
+  let closing: Promise<void> | undefined;
+  const lifecycle = {
+    connect: async (): Promise<void> => {
+      if (typeof db.connect === 'function') await db.connect();
+    },
+    disconnect: (): Promise<void> => {
+      closing ??= (async () => {
+        if (typeof db.disconnect === 'function') await db.disconnect();
+      })();
+      return closing;
+    },
+  };
 
   // Prefer the client's own raw seam, which emits a `$on('query')` event; a
   // client without one (an older core, a test stub) runs on the pool as before.
@@ -3228,6 +3952,48 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
    * transaction. Absent, it is a TypeError at the call site instead.
    */
   const build = (exts: ExtensionState): PrismaCompatClient<S> => {
+    /**
+     * The transaction-scoped compat client over ONE core transaction: a delegate
+     * per model (both spellings), extended like the base ones, plus the raw
+     * surface on the transaction's own connection. The callback `$transaction`
+     * and {@link bindTransaction} both build it here, so a transaction this
+     * layer opened and one it was handed cannot differ.
+     */
+    const txClientFor = (tx: CompatTransactionClient): Record<string, unknown> => {
+      const txDelegates: Record<string, PrismaModelDelegate<PrismaModelTypes>> = {};
+      for (const [prismaModel, mm] of delegateModels) {
+        setOwn(
+          txDelegates,
+          prismaModel,
+          extendDelegate(
+            makeDelegate(
+              ctx,
+              mm,
+              () => tx.table(mm.table),
+              (fn) => fn((n) => tx.table(n)),
+            ),
+            prismaModel,
+            exts,
+          ),
+        );
+        const alias = prismaPropertyAlias(prismaModel);
+        if (alias && !Object.hasOwn(map.models, alias) && !Object.hasOwn(txDelegates, alias)) {
+          setOwn(txDelegates, alias, ownLookup(txDelegates, prismaModel));
+        }
+      }
+      // Raw SQL on the transaction's own connection. Prisma's tx client
+      // carries these four, and code that mixes `$transaction` with raw SQL is
+      // the common case in a migrated codebase. No model can shadow them: a
+      // Prisma model name cannot start with `$`, and junction accessors skip
+      // every CLIENT_RESERVED_KEYS name.
+      const txClient: Record<string, unknown> = {
+        ...txDelegates,
+        ...makeRawSurface(txRunRaw(tx), ph, ctx.fragmentOf),
+      };
+      CORE_OF.set(txClient, tx);
+      return txClient;
+    };
+
     // Delegates bound to the base client, extended where the extension has
     // members for them. `baseDelegates` is built ONCE (outside), so a client
     // whose extension only adds `client` members shares the very same delegate
@@ -3283,36 +4049,10 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
         }
         // Callback form: hand the user a compat client bound to the tx connection.
         const fn = arg as (tx: PrismaCompatTransactionClient) => Promise<unknown>;
-        return db.$transaction((tx: CompatTransactionClient) => {
-          const txDelegates: Record<string, PrismaModelDelegate<PrismaModelTypes>> = {};
-          for (const [prismaModel, mm] of delegateModels) {
-            setOwn(
-              txDelegates,
-              prismaModel,
-              extendDelegate(
-                makeDelegate(
-                  ctx,
-                  mm,
-                  () => tx.table(mm.table),
-                  (fn) => fn((n) => tx.table(n)),
-                ),
-                prismaModel,
-                exts,
-              ),
-            );
-            const alias = prismaPropertyAlias(prismaModel);
-            if (alias && !Object.hasOwn(map.models, alias) && !Object.hasOwn(txDelegates, alias)) {
-              setOwn(txDelegates, alias, ownLookup(txDelegates, prismaModel));
-            }
-          }
-          // Raw SQL on the transaction's own connection. Prisma's tx client
-          // carries these four, and code that mixes `$transaction` with raw SQL is
-          // the common case in a migrated codebase. No model can shadow them: a
-          // Prisma model name cannot start with `$`, and junction accessors skip
-          // every CLIENT_RESERVED_KEYS name.
-          const txClient: Record<string, unknown> = { ...txDelegates, ...makeRawSurface(txRunRaw(tx), ph) };
-          return fn(txClient as unknown as PrismaCompatTransactionClient);
-        }, txOptions);
+        return db.$transaction(
+          (tx: CompatTransactionClient) => fn(txClientFor(tx) as unknown as PrismaCompatTransactionClient),
+          txOptions,
+        );
       }) as PrismaCompatClientBase['$transaction'],
 
       $extends: ((extension: unknown): unknown => {
@@ -3321,9 +4061,9 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
         return build(applyExtension(exts, extension as PrismaCompatExtension, modelKeys, clientKeys));
       }) as PrismaCompatClientBase['$extends'],
 
-      ...makeRawSurface(runRaw, ph),
-      $connect: async () => {},
-      $disconnect: async () => {},
+      ...makeRawSurface(runRaw, ph, ctx.fragmentOf),
+      $connect: () => lifecycle.connect(),
+      $disconnect: () => lifecycle.disconnect(),
     };
 
     // Assemble the result: model delegates keyed by Prisma model name, plus the
@@ -3341,6 +4081,16 @@ export function createPrismaCompatClient<S extends Record<string, PrismaModelTyp
     // client keys in applyExtension, so this can never overwrite a delegate.
     Object.assign(result, exts.client);
 
+    CORE_OF.set(result, client);
+    BIND_OF.set(result, (tx) => {
+      if (tx === (client as unknown) || typeof (tx as { table?: unknown } | null)?.table !== 'function') {
+        throw new ValidationError(
+          'prisma-compat: bindTransaction takes the core transaction client a `$transaction(async (tx) => ...)` ' +
+            'callback receives on the TurbineClient this compat client wraps.',
+        );
+      }
+      return txClientFor(tx);
+    });
     return result as unknown as PrismaCompatClient<S>;
   };
 

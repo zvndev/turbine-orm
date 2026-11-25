@@ -442,6 +442,19 @@ export function isPlainSchemaIdentifier(schema: string): boolean {
 }
 
 /**
+ * Whether `schema` is in the wider set of names {@link withSearchPathOption} emits with
+ * `quotedNames: true`: anything but whitespace, a double quote, a backslash or a
+ * NUL. The name is always written double-quoted, so these four are exactly the
+ * characters that could end the quoted name or split the `options` string into a
+ * second `-c`; every other character (a hyphen, a dot, non-ASCII letters) is part
+ * of the identifier. Used for Prisma's `?schema=`, where names such as
+ * `tenant-a` are ordinary.
+ */
+export function isQuotableSchemaName(schema: string): boolean {
+  return schema.length > 0 && !/[\s"\\]/.test(schema) && !schema.includes('\u0000');
+}
+
+/**
  * The one name outside {@link SEARCH_PATH_SCHEMA_PATTERN} that is still safe to
  * emit into the `options=-c` literal, and worth keeping.
  *
@@ -588,8 +601,9 @@ export function withSearchPathOption(
   connectionString: string,
   schema: string,
   alsoResolveIn: readonly string[] = [],
+  options: { quotedNames?: boolean } = {},
 ): string | null {
-  if (!isPlainSchemaIdentifier(schema)) return null;
+  if (!(options.quotedNames ? isQuotableSchemaName(schema) : isPlainSchemaIdentifier(schema))) return null;
   const setting = `-c search_path=${searchPathListValue(schema, alsoResolveIn)}`;
 
   const merged = mergeConnectionStringOptions(connectionString, setting);
@@ -604,4 +618,67 @@ export function withSearchPathOption(
   params.set('options', value);
   const head = q === -1 ? connectionString : connectionString.slice(0, q);
   return `${head}?${params.toString()}`;
+}
+
+// ---------------------------------------------------------------------------
+// Prisma's connection-string parameters
+// ---------------------------------------------------------------------------
+
+/**
+ * What a Prisma-style connection string asks for through the query parameters
+ * only Prisma's engine reads, with those parameters removed.
+ *
+ * node-postgres ignores `schema`, `connection_limit` and `pool_timeout`
+ * without a word, so a `DATABASE_URL` carried over from Prisma with
+ * `?schema=tenant_a` queried `public`: the most consequential silent drop a
+ * connection string can make. The client honours all three (see `TurbineClient`):
+ * `schema` becomes a connection-time `search_path`, `connection_limit` the pool
+ * size, and `pool_timeout` (seconds, `0` = wait forever) the checkout timeout.
+ */
+export interface PrismaUrlParameters {
+  /** The connection string without the three parameters, for the driver. */
+  readonly connectionString: string;
+  /** `schema`, when present and not empty. */
+  readonly schema?: string;
+  /** `connection_limit`, a positive integer. */
+  readonly connectionLimit?: number;
+  /** `pool_timeout` in milliseconds (`0` = no timeout). */
+  readonly poolTimeoutMs?: number;
+  /** Why a parameter cannot be honoured, for the caller's E003; the parameter is named, the URL never is. */
+  readonly invalid?: string;
+}
+
+const PRISMA_URL_PARAMETERS = ['schema', 'connection_limit', 'pool_timeout'] as const;
+
+/**
+ * Read (and strip) Prisma's `schema` / `connection_limit` / `pool_timeout`.
+ * `null` when the string carries none of them, which is every Turbine-native
+ * connection string, so those pass through byte-for-byte. Only the query string
+ * is rewritten, never the userinfo or host (see
+ * {@link mergeConnectionStringOptions} for why).
+ */
+export function readPrismaUrlParameters(connectionString: string): PrismaUrlParameters | null {
+  const q = connectionString.indexOf('?');
+  if (q === -1) return null;
+  const params = new URLSearchParams(connectionString.slice(q + 1));
+  if (!PRISMA_URL_PARAMETERS.some((name) => params.has(name))) return null;
+  const schema = params.get('schema') ?? '';
+  const limit = params.get('connection_limit');
+  const timeout = params.get('pool_timeout');
+  for (const name of PRISMA_URL_PARAMETERS) params.delete(name);
+  const rest = params.toString();
+  const stripped = connectionString.slice(0, rest ? q + 1 : q) + rest;
+  const out: { -readonly [K in keyof PrismaUrlParameters]: PrismaUrlParameters[K] } = { connectionString: stripped };
+  if (schema !== '') out.schema = schema;
+  if (limit !== null && limit !== '') {
+    const n = Number(limit);
+    if (!Number.isSafeInteger(n) || n < 1) out.invalid = 'connection_limit must be a positive integer';
+    else out.connectionLimit = n;
+  }
+  if (timeout !== null && timeout !== '') {
+    const n = Number(timeout);
+    if (!Number.isSafeInteger(n) || n < 0) out.invalid = 'pool_timeout must be a non-negative whole number of seconds';
+    else out.poolTimeoutMs = n * 1000;
+  }
+  return out;
 }

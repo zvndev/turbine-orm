@@ -143,8 +143,10 @@ export class TransactionState {
   private readonly root: TransactionScope;
   /** Frames whose SAVEPOINT is set and not yet released or rolled back, outermost first. */
   private readonly openFrames: TransactionScope[] = [];
-  /** Statements sent on the connection that have not answered yet. */
+  /** Statements sent on the connection (or queued to be) that have not answered yet. */
   private onWire = 0;
+  /** Settles when the last statement handed to {@link send} has answered; it never rejects. */
+  private wireTail: Promise<void> = Promise.resolve();
   /** A cancellable statement owns admission until its listener and delivery settle. */
   private exclusive = false;
   /** Statements and savepoint blocks started through the transaction that have not settled. */
@@ -314,7 +316,12 @@ export class TransactionState {
           this.settled();
         });
       }
-      const result = await this.send(statement);
+      const result = await this.send(statement, () => {
+        // Re-read after waiting for the statements queued ahead of this one: one
+        // of them may have ended or aborted the transaction meanwhile.
+        this.assertOpen();
+        if (!recovery) this.assertNotAborted();
+      });
       if (recovery) this.clearAbort();
       return result;
     } finally {
@@ -364,15 +371,48 @@ export class TransactionState {
   }
 
   /** Put one statement on the wire, counted for {@link whenIdle} and recorded on failure. */
-  private async send<T>(statement: () => Promise<T>): Promise<T> {
+  /**
+   * Send one statement, after every statement sent before it has answered.
+   *
+   * A transaction owns ONE connection, and `Promise.all([tx.a(), tx.b()])` (or a
+   * batched relation load, whose sibling loads start together) handed both to
+   * the driver at once. pg queues the second on the client itself, which it
+   * reports as deprecated and pg 9 removes; other drivers do not queue at all.
+   * The order is kept here instead, in call order, unless the driver pipelines.
+   * `recheck` runs after the wait and before sending, so a statement queued
+   * behind one that aborted or ended the transaction is refused rather than sent.
+   */
+  private async send<T>(statement: () => Promise<T>, recheck?: () => void, inOrder = true): Promise<T> {
+    // A driver that pipelines (`supportsPipelining`) takes concurrent
+    // statements by design and answers them in order; the batch
+    // `$transaction([...])` path relies on dispatching them all at once there.
+    const ordered = inOrder && (this.client as { supportsPipelining?: unknown }).supportsPipelining !== true;
+    // Nothing ahead: send now, with no extra turn of the event loop.
+    const queued = ordered && this.onWire > 0;
     this.onWire++;
+    const previous = this.wireTail;
+    let done: () => void = () => {};
+    if (ordered) {
+      this.wireTail = new Promise<void>((resolve) => {
+        done = resolve;
+      });
+    }
+    let sent = false;
     try {
+      if (queued) {
+        await previous;
+        recheck?.();
+      }
+      sent = true;
       return await statement();
     } catch (err) {
+      // A refusal by `recheck` is not a statement failure: nothing was sent.
+      if (!sent) throw err;
       this.noteFailure(err);
       if (this.abortsOnError && reportedByServer(err)) this.noteDead(err);
       throw err;
     } finally {
+      done();
       this.settled();
     }
   }
@@ -530,7 +570,9 @@ export class TransactionState {
       }
       this.assertNotAborted();
       const name = `sp_${++this.savepointCount}`;
-      await this.control(this.dialect.savepointStatement(name));
+      // In order: a statement issued before this block and still queued
+      // behind one on the wire belongs outside the savepoint.
+      await this.control(this.dialect.savepointStatement(name), true);
       const opened: TransactionScope = {
         state: this,
         parent,
@@ -627,10 +669,25 @@ export class TransactionState {
    * Typed INSIDE the statement, so the failure the state records is the Turbine
    * error and not the driver's.
    */
-  private async control(sql: string): Promise<void> {
+  private async control(sql: string, inOrder = false): Promise<void> {
     this.assertOpen();
     this.assertAvailable();
-    await this.send(() => sendControl(this.client, sql));
+    // RELEASE and ROLLBACK TO are not ordered behind statements still on the
+    // wire: a ROLLBACK TO after a statement cut short by its deadline is how
+    // that statement's outcome is settled, and it must not wait for the
+    // statement to end. A SAVEPOINT is (`inOrder`): sent past a statement
+    // queued before it, it would open the block around that statement, and
+    // the block's rollback would undo a statement that reported success.
+    await this.send(
+      () => sendControl(this.client, sql),
+      inOrder
+        ? () => {
+            this.assertOpen();
+            this.assertNotAborted();
+          }
+        : undefined,
+      inOrder,
+    );
   }
 }
 

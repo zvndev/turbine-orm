@@ -76,12 +76,14 @@ Run that grep, and review every write whose `data` nests one of those fields.
 
 These are all supported today, so don't infer absence from a missing example:
 
-- **Nested writes**, `create` / `connect` / `connectOrCreate` on create, plus `disconnect` / `set` / `delete` / `update` / `upsert` on update, in one transaction (depth cap 10). On a **many-to-many** relation the supported set is `connect` / `disconnect` / `set` (Turbine writes the junction rows); the rest throw `ValidationError` (`TURBINE_E003`) naming that set. The compat client also exposes an accessor per implicit junction table, so link rows can be written by hand inside the same `$transaction`.
-- **Relation `_count`**, `with: { _count: { posts: true } }` counts to-many relations without loading them.
+- **Nested writes**, `create` / `createMany` / `connect` / `connectOrCreate` on create, plus `disconnect` / `set` / `delete` / `update` / `upsert` on update, in one transaction (depth cap 10). A to-one `upsert` / `update` may leave out `where`. The compat client fills Prisma's client defaults (`cuid()` / `uuid()` ids, `@default(now())`, `@updatedAt`) on nested rows as on the top-level one. On a **many-to-many** relation the supported set is `connect` / `disconnect` / `set` (Turbine writes the junction rows); the rest throw `ValidationError` (`TURBINE_E003`) naming that set. The compat client also exposes an accessor per implicit junction table, so link rows can be written by hand inside the same `$transaction`.
+- **Relation `_count`**, `with: { _count: { posts: true } }` counts to-many relations without loading them. On the compat client `_count` also works below the top level and with a `where` per relation, and a write's `include` / relation `select` returns the written row with its relations (read back in the same transaction).
 - **`distinct`**, compiles to `DISTINCT ON`.
 - **`cursor`**, keyset pagination (exclusive; drop any `skip: 1`). It must name one row by a unique key, and the page follows `orderBy` completed by the primary key.
 - **Deterministic pages**: a compat `findMany` with `take` / `skip` and no `orderBy` is ordered by the model's primary key ascending, as Prisma does, so ported pagination cannot repeat or skip a row. Core keeps the bare `LIMIT` unless you set `implicitPkOrdering: true`.
 - **`groupBy`** and **`aggregate`**, `_count` / `_sum` / `_avg` / `_min` / `_max`.
-- **Typed raw SQL**, `` db.raw`...` `` and the typed `` db.sql<T>`...` `` (Prisma's TypedSQL replacement).
+- **Typed raw SQL**, `` db.raw`...` `` and the typed `` db.sql<T>`...` `` (Prisma's TypedSQL replacement). On the compat client, pass `prismaNamespace: Prisma` (from `@prisma/client`) to `createPrismaCompatClient` and that library's `Prisma.sql` / `join` / `raw` / `empty` fragments compose in `$queryRaw` / `$executeRaw`, nested or as the lone argument.
+- **Prisma connection-string parameters**: `?schema=` (a connection-time `search_path`), `connection_limit` and `pool_timeout` are honoured by the client.
+- **Porting module by module**: `turbineOf(prisma)` / `turbineOf(tx)` from `turbine-orm/prisma-compat` hand out the core client or the core transaction under a compat client, and `bindTransaction(prisma, coreTx)` runs compat calls inside a core transaction.
 
 Before you benchmark, run `npx turbine doctor --fix` to add the foreign-key indexes Prisma leaves off, see the [canonical guide](https://turbineorm.dev/migrate-from-prisma) for why this is the one mandatory step.

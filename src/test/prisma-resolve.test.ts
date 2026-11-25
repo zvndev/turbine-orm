@@ -567,12 +567,12 @@ model Widget {
   function widgetSchema(): SchemaMetadata {
     const t = table('widgets', ['id', 'created_at', 'stamped_at', 'updated_at', 'label']);
     // uuid PK with NO database default (Prisma fills it client-side); stamped_at
-    // DOES have a db default so its now() must not be carried.
+    // DOES have a db default, which a Prisma client never relies on.
     for (const c of t.columns) c.hasDefault = c.name === 'stamped_at';
     return { enums: {}, tables: { widgets: t } };
   }
 
-  it('carries uuid/now/updatedAt for db-defaultless columns only', () => {
+  it('carries uuid for a db-defaultless column, and now / updatedAt always', () => {
     const res = resolvePrismaSchema(parsePrismaSchema(prisma), widgetSchema());
     // Spread: the resolver's records are prototype-less, and deepEqual compares prototypes.
     assert.deepEqual(
@@ -580,9 +580,20 @@ model Widget {
       {
         id: 'uuid',
         created_at: 'now',
+        // A database DEFAULT CURRENT_TIMESTAMP does not stop Prisma sending its
+        // own clock's time, so the map carries it too: the database clock and
+        // the app clock differ, and code compares fresh rows with `new Date()`.
+        stamped_at: 'now',
         updated_at: 'updatedAt',
       },
     );
+  });
+
+  it('leaves a uuid() to a database default the column has', () => {
+    const t = table('widgets', ['id', 'created_at', 'stamped_at', 'updated_at', 'label']);
+    for (const c of t.columns) c.hasDefault = c.name === 'id';
+    const res = resolvePrismaSchema(parsePrismaSchema(prisma), { enums: {}, tables: { widgets: t } });
+    assert.equal(res.map.models.Widget!.clientDefaults?.id, undefined);
   });
 
   it('omits the key entirely when a model has no client-side defaults', () => {
@@ -594,7 +605,10 @@ model Widget {
   it('serializes clientDefaults into the generated map module', () => {
     const res = resolvePrismaSchema(parsePrismaSchema(prisma), widgetSchema());
     const out = generatePrismaMap(res.map);
-    assert.match(out, /clientDefaults: \{ id: 'uuid', created_at: 'now', updated_at: 'updatedAt' \}/);
+    assert.match(
+      out,
+      /clientDefaults: \{ id: 'uuid', created_at: 'now', stamped_at: 'now', updated_at: 'updatedAt' \}/,
+    );
   });
 });
 
