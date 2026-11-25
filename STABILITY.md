@@ -101,7 +101,7 @@ The practical guidance: stay on the latest minor. We do not backport fixes to ol
 - **Published releases, in sync.** Every release has a matching `vX.Y.Z` git tag **and** a published GitHub Release with notes. npm, git tags, and GitHub Releases agree. (See [GitHub Releases](https://github.com/zvndev/turbine-orm/releases) and [CHANGELOG.md](./CHANGELOG.md); [docs/releases/](./docs/releases/) holds only one hand-written file from before that step was automated.)
 - **Migration durability.** The migration format and `_turbine_migrations` schema are committed to as-is, a 1.0 upgrade must not require re-checksumming or re-applying existing migrations.
 
-### Honest status today (0.94 line)
+### Honest status today (0.96 line)
 
 We are **not at 1.0 yet**, and the gaps are specific. (This section is dated by its claims, not by a version stamp; an earlier revision froze itself at 0.48.0 and quietly aged for 16 minors.)
 
